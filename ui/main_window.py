@@ -87,6 +87,7 @@ class MainWindow(tk.Frame):
         if "target_sine_radius" in self.sim.params:
             self._set_slider_value("target_sine_radius", self.sim.params["target_sine_radius"])
 
+
     def _on_slider_change(self, key, value):
         self._set_slider_value(key, value)
         if self.sim is None:
