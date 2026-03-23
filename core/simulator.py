@@ -57,6 +57,61 @@ class DirectGuidanceSimulator:
     def replace_runtime_parameters(self, params: dict) -> None:
         self.params.update(params)
 
+    def _guidance_method(self) -> str:
+        return str(self.params.get("guidance_method", "Прямой метод"))
+
+    def _direct_guidance_direction(self, rel: np.ndarray, current_dir: np.ndarray, dt: float) -> np.ndarray:
+        missile_speed = float(self.params["missile_speed"])
+        a_n_max = float(self.params.get("missile_max_normal_acc", 1e9))
+        los_hat = normalize(rel)
+        desired_dir = los_hat
+        dot_cd = float(np.clip(np.dot(current_dir, desired_dir), -1.0, 1.0))
+        ang = float(np.arccos(dot_cd))
+        cross_z = current_dir[0] * desired_dir[1] - current_dir[1] * desired_dir[0]
+        if cross_z > 0.0:
+            sign = 1.0
+        elif cross_z < 0.0:
+            sign = -1.0
+        else:
+            sign = 0.0
+
+        omega_max = a_n_max / max(missile_speed, 1e-9)
+        max_turn = omega_max * dt
+        if ang > max_turn and max_turn > 0.0:
+            turn = sign * max_turn
+            c = float(np.cos(turn))
+            s = float(np.sin(turn))
+            rot = np.array([[c, -s], [s, c]], dtype=float)
+            return normalize(rot @ current_dir)
+        return desired_dir
+
+    def _proportional_navigation_direction(self, rel: np.ndarray, current_dir: np.ndarray, dt: float) -> np.ndarray:
+        missile_speed = float(self.params["missile_speed"])
+        a_n_max = float(self.params.get("missile_max_normal_acc", 1e9))
+        nav_const = float(self.params.get("navigation_constant", 3.0))
+
+        rel_norm_sq = float(np.dot(rel, rel))
+        if rel_norm_sq < 1e-12:
+            return current_dir
+
+        rel_vel = self.target.vel - self.missile.vel
+        los_rate = (rel[0] * rel_vel[1] - rel[1] * rel_vel[0]) / rel_norm_sq
+
+        # По конспекту: theta_dot = C * omega_LOS, эквивалентно a_n = V_m * C * omega_LOS.
+        commanded_acc = nav_const * missile_speed * los_rate
+        commanded_acc = float(np.clip(commanded_acc, -a_n_max, a_n_max))
+        turn = (commanded_acc / max(missile_speed, 1e-9)) * dt
+
+        c = float(np.cos(turn))
+        s = float(np.sin(turn))
+        rot = np.array([[c, -s], [s, c]], dtype=float)
+        return normalize(rot @ current_dir)
+
+    def _next_missile_direction(self, rel: np.ndarray, current_dir: np.ndarray, dt: float) -> np.ndarray:
+        if self._guidance_method() == "Пропорциональное наведение":
+            return self._proportional_navigation_direction(rel, current_dir, dt)
+        return self._direct_guidance_direction(rel, current_dir, dt)
+
     def _record(self) -> None:
         rel = self.target.pos - self.missile.pos
         d = norm(rel)
@@ -95,22 +150,23 @@ class DirectGuidanceSimulator:
 
         if mode == "sinusoidal":
             # Цель движется по гладкой синусоидальной траектории с ПОСТОЯННЫМ модулем скорости.
-            # Радиус синуса влияет на геометрию траектории, но не увеличивает модуль скорости.
-            radius = float(self.params.get("target_sine_radius", 1500.0))
-            k = float(self.params.get("target_sine_k", 0.0012))  # пространственная частота, рад/м
+            # Амплитуда синуса влияет на размах траектории, а частота - на число колебаний по пути.
+            amplitude = float(self.params.get("target_sine_amplitude", 1500.0))
+            frequency = float(self.params.get("target_sine_frequency", 0.0002))  # циклы/м
+            wave_number = 2.0 * np.pi * frequency                                 # рад/м
             phase = float(self.params.get("target_sine_phase", 0.0))
             vmag = max(self.target_base_speed, 1e-9)
 
-            arg = k * self.target_u + phase
-            slope = radius * k * np.cos(arg)              # dw/du
+            arg = wave_number * self.target_u + phase
+            slope = amplitude * wave_number * np.cos(arg)              # dw/du
             ds_du = np.sqrt(1.0 + slope * slope)          # ds/du
             du_dt = vmag / ds_du                          # обеспечивает |v| = const
 
             self.target_u += du_dt * dt
-            arg = k * self.target_u + phase
-            w = radius * np.sin(arg)
-            slope = radius * k * np.cos(arg)
-            curv2 = -radius * k * k * np.sin(arg)         # d2w/du2
+            arg = wave_number * self.target_u + phase
+            w = amplitude * np.sin(arg)
+            slope = amplitude * wave_number * np.cos(arg)
+            curv2 = -amplitude * wave_number * wave_number * np.sin(arg)         # d2w/du2
 
             # Положение на синусоидальной линии в базисе (e, n)
             self.target.pos = self.target_ref_pos + self.target_longitudinal * self.target_u + self.target_normal * w
@@ -133,7 +189,6 @@ class DirectGuidanceSimulator:
         dt = float(self.params["dt"])
         hit_threshold = float(self.params["hit_threshold"])
         missile_speed = float(self.params["missile_speed"])
-        a_n_max = float(self.params.get("missile_max_normal_acc", 1e9))
 
         rel = self.target.pos - self.missile.pos
         d = norm(rel)
@@ -145,33 +200,13 @@ class DirectGuidanceSimulator:
             self.history.missile_final_course_deg = angle_deg(self.missile.vel)
             return
 
-        los_hat = normalize(rel)
         current_dir = normalize(self.missile.vel)
         if norm(current_dir) < 1e-12:
-            current_dir = los_hat.copy()
+            current_dir = normalize(rel)
+            if norm(current_dir) < 1e-12:
+                current_dir = np.array([1.0, 0.0], dtype=float)
 
-        desired_dir = los_hat
-        dot_cd = float(np.clip(np.dot(current_dir, desired_dir), -1.0, 1.0))
-        ang = float(np.arccos(dot_cd))
-        cross_z = current_dir[0] * desired_dir[1] - current_dir[1] * desired_dir[0]
-        if cross_z > 0.0:
-            sign = 1.0
-        elif cross_z < 0.0:
-            sign = -1.0
-        else:
-            sign = 0.0
-
-        omega_max = a_n_max / max(missile_speed, 1e-9)
-        max_turn = omega_max * dt
-
-        if ang > max_turn and max_turn > 0.0:
-            turn = sign * max_turn
-            c = float(np.cos(turn))
-            s = float(np.sin(turn))
-            rot = np.array([[c, -s], [s, c]], dtype=float)
-            new_dir = normalize(rot @ current_dir)
-        else:
-            new_dir = desired_dir
+        new_dir = self._next_missile_direction(rel, current_dir, dt)
 
         self.missile.vel = new_dir * missile_speed
 

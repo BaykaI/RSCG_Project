@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk, messagebox
 import numpy as np
@@ -15,14 +15,26 @@ from core.entities import BodyState
 from core.math2d import vec, from_angle_deg, normalize, perp, norm
 from core.simulator import DirectGuidanceSimulator
 
-TRAJ_MISSILE_COLOR = "black"
-TRAJ_TARGET_COLOR = "red"
-VECTOR_COLOR = "#1f77b4"
-REPLACE_BG = "#fff2a8"
+BG_COLOR = "#313338"
+PANEL_BG = "#2B2D31"
+SURFACE_BG = "#1E1F22"
+TEXT_COLOR = "#F2F3F5"
+MUTED_TEXT = "#B5BAC1"
+GRID_COLOR = "#4E5058"
+ACCENT_COLOR = "#5865F2"
+ENTRY_BG = "#1E1F22"
+ENTRY_FG = "#F2F3F5"
+REPLACE_BG = "#3F4258"
+REPLACE_FG = "#F8E58C"
+
+TRAJ_MISSILE_COLOR = "#4EA8FF"
+TRAJ_TARGET_COLOR = "#ED4245"
+VECTOR_COLOR = "#57F287"
+HIT_COLOR = "#A3E635"
 
 class MainWindow(tk.Frame):
     def __init__(self, master):
-        super().__init__(master)
+        super().__init__(master, bg=BG_COLOR)
         self.vars = {}
         self.replace_vars = {}
         self.info_var = tk.StringVar(value="Готов к расчету")
@@ -38,14 +50,70 @@ class MainWindow(tk.Frame):
         self.slider_scales = {}
         self.current_target_motion_mode = "stationary"
         self.sine_params = None
+        self.sine_controls_frame = None
+        self.sine_amplitude_info_var = tk.StringVar(value="R = -")
+        self.sine_frequency_info_var = tk.StringVar(value="f = -")
+        self._configure_theme()
         self._build_ui()
         self._apply_values(DEFAULT_VALUES)
         self._apply_scenario_values("Цель стоит")
         self._apply_replace_defaults()
         self._draw_empty()
 
+    def _configure_theme(self):
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
 
-    def _add_live_slider(self, parent, row, key, label, from_, to_):
+        self.master.configure(bg=BG_COLOR)
+        style.configure(".", background=BG_COLOR, foreground=TEXT_COLOR)
+        style.configure("TFrame", background=BG_COLOR)
+        style.configure("TLabel", background=BG_COLOR, foreground=TEXT_COLOR)
+        style.configure("Muted.TLabel", background=BG_COLOR, foreground=MUTED_TEXT)
+        style.configure("TSeparator", background=GRID_COLOR)
+        style.configure("TPanedwindow", background=BG_COLOR)
+        style.configure("TLabelframe", background=BG_COLOR, foreground=TEXT_COLOR, borderwidth=1)
+        style.configure("TLabelframe.Label", background=BG_COLOR, foreground=TEXT_COLOR)
+        style.configure(
+            "TButton",
+            background=PANEL_BG,
+            foreground=TEXT_COLOR,
+            borderwidth=0,
+            padding=(8, 5),
+        )
+        style.map(
+            "TButton",
+            background=[("active", ACCENT_COLOR), ("pressed", "#4752C4"), ("disabled", "#232428")],
+            foreground=[("disabled", "#7A7E87")],
+        )
+        style.configure(
+            "TEntry",
+            fieldbackground=ENTRY_BG,
+            foreground=ENTRY_FG,
+            insertcolor=ENTRY_FG,
+            borderwidth=0,
+            padding=4,
+        )
+        style.configure(
+            "TCombobox",
+            fieldbackground=ENTRY_BG,
+            background=PANEL_BG,
+            foreground=ENTRY_FG,
+            arrowcolor=TEXT_COLOR,
+            borderwidth=0,
+            padding=4,
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", ENTRY_BG)],
+            foreground=[("readonly", ENTRY_FG)],
+            selectbackground=[("readonly", ACCENT_COLOR)],
+            selectforeground=[("readonly", TEXT_COLOR)],
+        )
+
+    def _add_live_slider(self, parent, row, key, label, from_, to_, resolution=0.1):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=1)
         var = tk.DoubleVar(value=0.0)
         self.slider_vars[key] = var
@@ -55,10 +123,15 @@ class MainWindow(tk.Frame):
             from_=from_,
             to=to_,
             orient="horizontal",
-            resolution=0.1,
+            resolution=resolution,
             showvalue=False,
             length=155,
             command=lambda value, k=key: self._on_slider_change(k, float(value)),
+            bg=BG_COLOR,
+            fg=TEXT_COLOR,
+            troughcolor=SURFACE_BG,
+            activebackground=ACCENT_COLOR,
+            highlightthickness=0,
         )
         scale.grid(row=row, column=1, columnspan=2, sticky="ew", pady=1)
         lbl = ttk.Label(parent, text="0.0")
@@ -71,7 +144,10 @@ class MainWindow(tk.Frame):
         if key in self.slider_vars:
             self.slider_vars[key].set(float(value))
         if key in self.slider_value_labels:
-            self.slider_value_labels[key].configure(text=f"{float(value):.2f}")
+            fmt = "{:.2f}"
+            if key == "target_sine_frequency":
+                fmt = "{:.4f}"
+            self.slider_value_labels[key].configure(text=fmt.format(float(value)))
 
     def _sync_sliders_from_model(self):
         if self.sim is None:
@@ -84,8 +160,72 @@ class MainWindow(tk.Frame):
         self._set_slider_value("target_az", self.sim.target.acc[1])
         self._set_slider_value("wind_x", wind[0])
         self._set_slider_value("wind_z", wind[1])
-        if "target_sine_radius" in self.sim.params:
-            self._set_slider_value("target_sine_radius", self.sim.params["target_sine_radius"])
+        self._update_sine_output_labels()
+
+    def _target_speed_for_sine(self) -> float:
+        return norm(vec(self._f("target_vx"), self._f("target_vz")))
+
+    def _auto_sine_frequency(self, speed: float, target_a_n_max: float) -> float:
+        if speed <= 1e-9 or target_a_n_max <= 1e-9:
+            return 0.0002
+        turn_radius = speed * speed / target_a_n_max
+        wavelength = max(200.0, 4.0 * turn_radius)
+        return float(np.clip(1.0 / wavelength, 0.0001, 0.0050))
+
+    def _max_sine_normal_acc(self, amplitude: float, frequency: float, speed: float) -> float:
+        if amplitude <= 0.0 or frequency <= 0.0 or speed <= 0.0:
+            return 0.0
+        wave_number = 2.0 * math.pi * frequency
+        phi = np.linspace(0.0, 2.0 * math.pi, 4096, endpoint=False)
+        slope = amplitude * wave_number * np.cos(phi)
+        curv2 = -amplitude * wave_number * wave_number * np.sin(phi)
+        curvature = np.abs(curv2) / np.power(1.0 + slope * slope, 1.5)
+        return float(speed * speed * np.max(curvature))
+
+    def _update_sine_output_labels(self):
+        try:
+            amplitude = self._f("target_sine_amplitude")
+            frequency = self._f("target_sine_frequency")
+            self.sine_amplitude_info_var.set(f"R = {amplitude:.1f} м")
+            self.sine_frequency_info_var.set(f"f = {frequency:.4f} 1/м")
+        except Exception:
+            self.sine_amplitude_info_var.set("R = -")
+            self.sine_frequency_info_var.set("f = -")
+
+    def _pick_sine_parameters_from_target_acc(self):
+        try:
+            target_speed = self._target_speed_for_sine()
+            target_a_n_max = self._f("target_max_normal_acc")
+
+            if target_speed <= 1e-9:
+                raise ValueError("Для расчета параметров скорость ОС должна быть больше нуля.")
+            if target_a_n_max <= 0.0:
+                raise ValueError("a_n,max ОС должно быть больше нуля.")
+
+            frequency = self._auto_sine_frequency(target_speed, target_a_n_max)
+            lo = 0.0
+            hi = 100.0
+            while self._max_sine_normal_acc(hi, frequency, target_speed) < target_a_n_max and hi < 1e6:
+                hi *= 2.0
+
+            for _ in range(60):
+                mid = 0.5 * (lo + hi)
+                if self._max_sine_normal_acc(mid, frequency, target_speed) <= target_a_n_max:
+                    lo = mid
+                else:
+                    hi = mid
+
+            amplitude = lo
+            self.vars["target_sine_amplitude"].set(f"{amplitude:.3f}")
+            self.vars["target_sine_frequency"].set(f"{frequency:.6f}")
+            self._update_sine_output_labels()
+
+            if self.sim is not None and self.paused and self.current_target_motion_mode == "sinusoidal":
+                self.sim.params["target_sine_amplitude"] = amplitude
+                self.sim.params["target_sine_frequency"] = frequency
+                self._render(True)
+        except Exception as exc:
+            messagebox.showerror("Ошибка расчета синусоиды", str(exc))
 
 
     def _on_slider_change(self, key, value):
@@ -116,31 +256,29 @@ class MainWindow(tk.Frame):
             self.sim.params["wind"][0] = value
         elif key == "wind_z":
             self.sim.params["wind"][1] = value
-
         self._render(True)
-
 
     def _build_ui(self):
         paned = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
         paned.pack(fill="both", expand=True)
 
         # Левая область со скроллингом
-        self.left_container = ttk.Frame(paned)
-        self.right_panel = ttk.Frame(paned, padding=8)
+        self.left_container = ttk.Frame(paned, style="TFrame")
+        self.right_panel = ttk.Frame(paned, padding=8, style="TFrame")
         paned.add(self.left_container, weight=0)
         paned.add(self.right_panel, weight=1)
 
         self.left_container.configure(width=650)
         self.left_container.pack_propagate(False)
 
-        self.left_canvas = tk.Canvas(self.left_container, highlightthickness=0)
+        self.left_canvas = tk.Canvas(self.left_container, highlightthickness=0, bg=BG_COLOR)
         self.left_scrollbar = ttk.Scrollbar(self.left_container, orient="vertical", command=self.left_canvas.yview)
         self.left_canvas.configure(yscrollcommand=self.left_scrollbar.set)
 
         self.left_scrollbar.pack(side="right", fill="y")
         self.left_canvas.pack(side="left", fill="both", expand=True)
 
-        self.left_panel = ttk.Frame(self.left_canvas, padding=8)
+        self.left_panel = ttk.Frame(self.left_canvas, padding=8, style="TFrame")
         self.left_window_id = self.left_canvas.create_window((0, 0), window=self.left_panel, anchor="nw")
 
         def _on_left_configure(event=None):
@@ -185,22 +323,34 @@ class MainWindow(tk.Frame):
             ttk.Label(p, text=title).grid(row=row, column=0, columnspan=3, sticky="w")
             row += 1
 
-        def entry(key, label, replace_key=None):
+        def entry(key, label, replace_key=None, parent=None):
             nonlocal row
-            ttk.Label(p, text=label).grid(row=row, column=0, sticky="w", pady=1)
+            grid_parent = p if parent is None else parent
+            ttk.Label(grid_parent, text=label).grid(row=row, column=0, sticky="w", pady=1)
             var = tk.StringVar()
             self.vars[key] = var
-            e = ttk.Entry(p, textvariable=var, width=14)
+            e = ttk.Entry(grid_parent, textvariable=var, width=14)
             e.grid(row=row, column=1, sticky="ew", pady=1)
             self.locked_widgets.append(e)
 
             if replace_key is not None:
                 rvar = tk.StringVar()
                 self.replace_vars[replace_key] = rvar
-                re = tk.Entry(p, textvariable=rvar, width=14, bg=REPLACE_BG)
+                re = tk.Entry(
+                    grid_parent,
+                    textvariable=rvar,
+                    width=14,
+                    bg=REPLACE_BG,
+                    fg=REPLACE_FG,
+                    insertbackground=REPLACE_FG,
+                    relief="flat",
+                    highlightthickness=1,
+                    highlightbackground="#7c651d",
+                    highlightcolor=ACCENT_COLOR,
+                )
                 re.grid(row=row, column=2, sticky="ew", pady=1, padx=(8,0))
             else:
-                ttk.Label(p, text="").grid(row=row, column=2, sticky="ew")
+                ttk.Label(grid_parent, text="").grid(row=row, column=2, sticky="ew")
             row += 1
 
         combo("Метод наведения", GUIDANCE_METHODS, "guidance_method", GUIDANCE_METHODS[0])
@@ -208,12 +358,18 @@ class MainWindow(tk.Frame):
         cb = combo("Сценарий", SCENARIOS, "scenario", SCENARIOS[0])
         cb.bind("<<ComboboxSelected>>", self._on_scenario)
 
+        # Внутренние параметры синусоидального движения храним без прямого редактирования в UI.
+        for hidden_key in ("target_sine_amplitude", "target_sine_frequency", "target_sine_phase"):
+            if hidden_key not in self.vars:
+                self.vars[hidden_key] = tk.StringVar()
+
         sep("ОУ")
         entry("missile_x", "x, м")
         entry("missile_z", "z, м")
         entry("missile_speed", "скорость, м/с", "missile_speed_new")
         entry("missile_course_deg", "курс, град")
         entry("missile_max_normal_acc", "a_n max, м/с²")
+        entry("navigation_constant", "N")
 
         sep("ОС")
         entry("target_x", "x, м")
@@ -232,13 +388,37 @@ class MainWindow(tk.Frame):
         entry("hit_threshold", "порог, м")
         entry("steps_per_frame", "шагов за кадр")
         entry("frame_delay_ms", "задержка кадра, мс")
-        entry("target_sine_radius", "радиус синуса, м")
 
-
-        ttk.Label(p, text="Желтые поля справа: можно менять только скорости, ускорения и ветер в паузе").grid(
+        ttk.Label(p, text="Желтые поля справа: можно менять в паузе скорости, ускорения, ветер и параметры синусоиды цели", style="Muted.TLabel").grid(
             row=row, column=0, columnspan=4, sticky="w", pady=(8, 0)
         )
         row += 1
+
+        self.sine_controls_frame = ttk.LabelFrame(
+            p,
+            text="Параметры синусоидального движения",
+            padding=6,
+        )
+        self.sine_controls_frame.columnconfigure(1, weight=1)
+        self.sine_controls_frame.columnconfigure(2, weight=1)
+        self.sine_controls_frame.columnconfigure(3, weight=0)
+        self.sine_controls_frame.grid(row=row, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        sine_row_start = row
+        row = 0
+        entry("target_max_normal_acc", "a_n,max ОС, м/с²", parent=self.sine_controls_frame)
+        entry("target_sine_phase", "фаза синуса, рад", "target_sine_phase_new", parent=self.sine_controls_frame)
+        ttk.Button(
+            self.sine_controls_frame,
+            text="Рассчитать R и f",
+            command=self._pick_sine_parameters_from_target_acc,
+        ).grid(row=row, column=0, columnspan=3, sticky="ew", pady=(4, 6))
+        row += 1
+        ttk.Label(self.sine_controls_frame, textvariable=self.sine_amplitude_info_var).grid(row=row, column=0, columnspan=3, sticky="w", pady=1)
+        row += 1
+        ttk.Label(self.sine_controls_frame, textvariable=self.sine_frequency_info_var).grid(row=row, column=0, columnspan=3, sticky="w", pady=1)
+        row += 1
+        row = self._add_live_slider(self.sine_controls_frame, row, "target_sine_phase", "фаза синуса, рад", 0.0, 6.3, 0.01)
+        row = sine_row_start + 1
 
         ttk.Separator(p, orient="horizontal").grid(row=row, column=0, columnspan=4, sticky="ew", pady=(6, 4))
         row += 1
@@ -273,7 +453,7 @@ class MainWindow(tk.Frame):
         self.right_panel.rowconfigure(0, weight=1)
         self.right_panel.columnconfigure(0, weight=1)
         self.right_panel.columnconfigure(1, weight=0)
-        self.figure = Figure(figsize=(10, 8), dpi=100)
+        self.figure = Figure(figsize=(10, 8), dpi=100, facecolor=PANEL_BG)
         self.ax_traj = self.figure.add_subplot(211)
         self.ax_dist = self.figure.add_subplot(212)
         self.figure.subplots_adjust(left=0.08, right=0.98, top=0.95, bottom=0.07, hspace=0.38)
@@ -298,7 +478,10 @@ class MainWindow(tk.Frame):
         vals["target_x"] = 0.0
         vals["target_z"] = 0.0
         vals["target_course_deg"] = 0.0
-        vals["target_sine_radius"] = 1500.0
+        vals["target_sine_amplitude"] = 1500.0
+        vals["target_sine_frequency"] = 0.0002
+        vals["target_sine_phase"] = 0.0
+        vals["target_max_normal_acc"] = 10.0
         self.current_target_motion_mode = "stationary"
         self.sine_params = None
 
@@ -333,24 +516,27 @@ class MainWindow(tk.Frame):
 
         elif scenario_name == "Цель маневрирует по синусу":
             vx, vz, course = self._random_realistic_velocity()
-            radius = random.uniform(800.0, 3000.0)
-            k = random.uniform(0.0006, 0.0018)
+            amplitude = random.uniform(800.0, 3000.0)
+            frequency = random.uniform(0.0001, 0.0003)
             vals["target_vx"] = vx
             vals["target_vz"] = vz
             vals["target_course_deg"] = course
             vals["target_ax"] = 0.0
             vals["target_az"] = 0.0
-            vals["target_sine_radius"] = radius
+            vals["target_sine_amplitude"] = amplitude
+            vals["target_sine_frequency"] = frequency
+            vals["target_sine_phase"] = random.uniform(0.0, 2.0 * math.pi)
+            vals["target_max_normal_acc"] = self._max_sine_normal_acc(amplitude, frequency, norm(vec(vx, vz)))
             vals["t_max"] = 80.0
             self.current_target_motion_mode = "sinusoidal"
             self.sine_params = {
-                "target_base_acc": np.array([0.0, 0.0], dtype=float),
-                "target_sine_acc_amp": np.array([radius * omega * omega, radius * omega * omega], dtype=float),
-                "target_sine_omega": omega,
-                "target_sine_phase": random.uniform(0.0, 2.0 * math.pi),
+                "target_sine_frequency": frequency,
+                "target_sine_phase": vals["target_sine_phase"],
             }
 
         self._apply_values(vals)
+        self._update_sine_output_labels()
+        self._update_sine_controls_visibility()
     def _set_initial_locked(self, locked: bool):
         state = "disabled" if locked else "normal"
         combo_state = "disabled" if locked else "readonly"
@@ -363,6 +549,14 @@ class MainWindow(tk.Frame):
     def _on_scenario(self, event=None):
         self._apply_scenario_values(self.vars["scenario"].get())
         self._apply_replace_defaults()
+
+    def _update_sine_controls_visibility(self):
+        if self.sine_controls_frame is None:
+            return
+        if self.current_target_motion_mode == "sinusoidal":
+            self.sine_controls_frame.grid()
+        else:
+            self.sine_controls_frame.grid_remove()
 
     def _apply_values(self, values):
         for k, v in values.items():
@@ -392,8 +586,10 @@ class MainWindow(tk.Frame):
 
     def _runtime_params(self):
         params = {
+            "guidance_method": self.vars["guidance_method"].get(),
             "missile_speed": self._f("missile_speed"),
             "missile_max_normal_acc": self._f("missile_max_normal_acc"),
+            "navigation_constant": self._f("navigation_constant"),
             "wind": vec(self._f("wind_x"), self._f("wind_z")),
             "dt": self._f("dt"),
             "t_max": self._f("t_max"),
@@ -401,13 +597,14 @@ class MainWindow(tk.Frame):
             "target_motion_mode": self.current_target_motion_mode,
         }
         if self.sine_params is not None:
-            radius = self._f("target_sine_radius")
-            omega = float(self.sine_params.get("target_sine_omega", 0.5))
-            phase = float(self.sine_params.get("target_sine_phase", 0.0))
+            amplitude = self._f("target_sine_amplitude")
+            frequency = self._f("target_sine_frequency")
+            phase = self._f("target_sine_phase")
+            self.sine_params["target_sine_frequency"] = frequency
+            self.sine_params["target_sine_phase"] = phase
             params.update({
-                "target_base_acc": np.array([0.0, 0.0], dtype=float),
-                "target_sine_acc_amp": np.array([radius * omega * omega, radius * omega * omega], dtype=float),
-                "target_sine_omega": omega,
+                "target_sine_frequency": frequency,
+                "target_sine_amplitude": amplitude,
                 "target_sine_phase": phase,
             })
         return params
@@ -494,15 +691,23 @@ class MainWindow(tk.Frame):
             self.sim.target.acc = vec(self._fr("target_ax_new"), self._fr("target_az_new"))
 
             new_params = {
+                "guidance_method": self.vars["guidance_method"].get(),
                 "missile_speed": new_speed,
                 "missile_max_normal_acc": self._f("missile_max_normal_acc"),
+                "navigation_constant": self._f("navigation_constant"),
                 "wind": vec(self._fr("wind_x_new"), self._fr("wind_z_new")),
                 "dt": self._f("dt"),
                 "t_max": self._f("t_max"),
                 "hit_threshold": self._f("hit_threshold"),
             }
+            if self.current_target_motion_mode == "sinusoidal":
+                new_params.update({
+                    "target_sine_amplitude": self._f("target_sine_amplitude"),
+                    "target_sine_frequency": self._f("target_sine_frequency"),
+                    "target_sine_phase": self._f("target_sine_phase"),
+                })
             self.sim.replace_runtime_parameters(new_params)
-            self.info_var.set("Заменены только скорости, ускорения и ветер. Курс, dt, t_max, порог и координаты не изменялись.")
+            self.info_var.set("Заменены скорости, ускорения, ветер и параметры синусоидального движения. Курс, dt, t_max, порог и координаты не изменялись.")
             self._render(True)
         except Exception as exc:
             messagebox.showerror("Ошибка замены параметров", str(exc))
@@ -539,7 +744,7 @@ class MainWindow(tk.Frame):
         tail = pos - direction * 0.7 * size
         p1 = tail + left * 0.25 * size
         p2 = tail - left * 0.25 * size
-        return patches.Polygon([nose, p1, p2], closed=True, facecolor="black", edgecolor="black", zorder=7)
+        return patches.Polygon([nose, p1, p2], closed=True, facecolor=TRAJ_MISSILE_COLOR, edgecolor=TRAJ_MISSILE_COLOR, zorder=7)
 
     def _aircraft_patch(self, pos: np.ndarray, vel: np.ndarray, size: float) -> patches.Polygon:
         sp = norm(vel)
@@ -559,8 +764,11 @@ class MainWindow(tk.Frame):
 
     def _draw_empty(self):
         self.figure.clear()
+        self.figure.set_facecolor(PANEL_BG)
         self.ax_traj = self.figure.add_subplot(211)
         self.ax_dist = self.figure.add_subplot(212)
+        self._style_axes(self.ax_traj)
+        self._style_axes(self.ax_dist)
         self.ax_traj.set_title("Траектории в плоскости OXZ")
         self.ax_traj.set_xlabel("x, м")
         self.ax_traj.set_ylabel("z, м")
@@ -577,6 +785,16 @@ class MainWindow(tk.Frame):
         self.figure.subplots_adjust(left=0.08, right=0.98, top=0.95, bottom=0.07, hspace=0.38)
         self.canvas.draw()
 
+    def _style_axes(self, ax):
+        ax.set_facecolor(SURFACE_BG)
+        for spine in ax.spines.values():
+            spine.set_color(GRID_COLOR)
+        ax.tick_params(colors=TEXT_COLOR)
+        ax.xaxis.label.set_color(TEXT_COLOR)
+        ax.yaxis.label.set_color(TEXT_COLOR)
+        ax.title.set_color(TEXT_COLOR)
+        ax.grid(True, color=GRID_COLOR, alpha=0.65)
+
     def _draw_explosion(self, x, z):
         angles = np.linspace(0.0, 2.0 * np.pi, 12, endpoint=False)
         x0, x1 = self.ax_traj.get_xlim()
@@ -585,8 +803,9 @@ class MainWindow(tk.Frame):
         scale = max(0.012 * span, 90.0)
         radii = np.where(np.arange(12) % 2 == 0, scale, 0.45 * scale)
         points = np.column_stack((x + radii * np.cos(angles), z + radii * np.sin(angles)))
-        patch = patches.Polygon(points, closed=True, facecolor="none", edgecolor="black", linewidth=1.5, zorder=8)
+        patch = patches.Polygon(points, closed=True, facecolor="none", edgecolor=HIT_COLOR, linewidth=1.5, zorder=8)
         self.ax_traj.add_patch(patch)
+        self.ax_traj.plot([x], [z], marker="o", markersize=7, color=HIT_COLOR, linestyle="None", zorder=9, label="Точка встречи")
 
     def _draw_icons(self, missile_xy, target_xy):
         missile_xy = np.array(missile_xy, dtype=float)
@@ -649,8 +868,11 @@ class MainWindow(tk.Frame):
 
     def _render(self, show_vectors=False):
         self.figure.clear()
+        self.figure.set_facecolor(PANEL_BG)
         self.ax_traj = self.figure.add_subplot(211)
         self.ax_dist = self.figure.add_subplot(212)
+        self._style_axes(self.ax_traj)
+        self._style_axes(self.ax_dist)
         if self.sim is None:
             self._draw_empty()
             return
@@ -678,19 +900,25 @@ class MainWindow(tk.Frame):
         self.ax_traj.set_title("Траектории в плоскости OXZ")
         self.ax_traj.set_xlabel("x, м")
         self.ax_traj.set_ylabel("z, м")
-        self.ax_traj.grid(True)
         self.ax_traj.set_aspect("equal", adjustable="box")
         self.ax_traj.margins(x=0.08, y=0.12)
-        self.ax_traj.legend(loc="best")
+        legend_traj = self.ax_traj.legend(loc="best")
+        legend_traj.get_frame().set_facecolor(PANEL_BG)
+        legend_traj.get_frame().set_edgecolor(GRID_COLOR)
+        for text in legend_traj.get_texts():
+            text.set_color(TEXT_COLOR)
 
-        self.ax_dist.plot(time, distance, color="black", linewidth=1.8, label="Дальность")
+        self.ax_dist.plot(time, distance, color=TEXT_COLOR, linewidth=1.8, label="Дальность")
         if h.min_distance_time is not None:
-            self.ax_dist.plot([h.min_distance_time], [h.min_distance], marker="o", color="black", linestyle="None", label="d_min")
+            self.ax_dist.plot([h.min_distance_time], [h.min_distance], marker="o", color=TEXT_COLOR, linestyle="None", label="d_min")
         self.ax_dist.set_title("Дальность во времени")
         self.ax_dist.set_xlabel("t, с")
         self.ax_dist.set_ylabel("d, м")
-        self.ax_dist.grid(True)
-        self.ax_dist.legend(loc="best")
+        legend_dist = self.ax_dist.legend(loc="best")
+        legend_dist.get_frame().set_facecolor(PANEL_BG)
+        legend_dist.get_frame().set_edgecolor(GRID_COLOR)
+        for text in legend_dist.get_texts():
+            text.set_color(TEXT_COLOR)
 
         self.figure.subplots_adjust(left=0.08, right=0.98, top=0.95, bottom=0.07, hspace=0.38)
         self.canvas.draw()
@@ -707,13 +935,22 @@ class MainWindow(tk.Frame):
         vg_t = self.sim.target.vel + wind
         lines = []
         lines.append("Пауза" if self.paused else ("Расчет завершен" if self.sim.finished else "Анимация"))
+        lines.append(f"Метод: {self.sim.params.get('guidance_method', 'Прямой метод')}")
         lines.append(f"t = {self.sim.time:.2f} с")
         lines.append(f"d = {h.distance[-1]:.2f} м")
         lines.append(f"d_min = {h.min_distance:.2f} м")
         lines.append(f"V_ОУ = ({vg_m[0]:.2f}, {vg_m[1]:.2f}) м/с")
         lines.append(f"V_ОС = ({vg_t[0]:.2f}, {vg_t[1]:.2f}) м/с")
         lines.append(f"a_n,max = {self.sim.params.get('missile_max_normal_acc', 0.0):.2f} м/с²")
+        if self.sim.params.get("guidance_method") == "Пропорциональное наведение":
+            lines.append(f"N = {self.sim.params.get('navigation_constant', 3.0):.2f}")
+        if self.sim.params.get("target_motion_mode") == "sinusoidal":
+            lines.append(f"R = {self.sim.params.get('target_sine_amplitude', 0.0):.1f} м")
+            lines.append(f"f = {self.sim.params.get('target_sine_frequency', 0.0):.4f} 1/м")
+            lines.append(f"phase = {self.sim.params.get('target_sine_phase', 0.0):.2f} рад")
+            lines.append(f"a_n,max ОС = {self._f('target_max_normal_acc'):.2f} м/с²")
         lines.append(f"dt = {self.sim.params['dt']:.3f} с")
         if self.sim.finished:
             lines.append(f"Событие: {h.event.reason}")
         self.info_var.set("\n".join(lines))
+
