@@ -1,209 +1,110 @@
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import numpy as np
-from .math2d import norm, normalize, angle_deg
+from .math2d import normalize, norm, resample_polyline
 
 @dataclass
-class EventState:
-    happened: bool = False
-    hit: bool = False
-    miss: bool = False
-    time: float | None = None
-    distance: float | None = None
-    reason: str = ""
+class State:
+    missile_pos: np.ndarray
+    missile_air_vel: np.ndarray
+    missile_ground_vel: np.ndarray
+    target_pos: np.ndarray
+    target_ground_vel: np.ndarray
+    distance: float
+    time: float
+    theta_deg: float
+    eps_deg: float
+    jc_deg: float
 
 @dataclass
-class SimHistory:
-    t: list[float] = field(default_factory=list)
-    missile_pos: list[np.ndarray] = field(default_factory=list)
-    target_pos: list[np.ndarray] = field(default_factory=list)
-    missile_air_vel: list[np.ndarray] = field(default_factory=list)
-    missile_ground_vel: list[np.ndarray] = field(default_factory=list)
-    target_vel: list[np.ndarray] = field(default_factory=list)
-    distance: list[float] = field(default_factory=list)
-    min_distance: float = float("inf")
-    min_distance_time: float | None = None
-    min_distance_missile_pos: np.ndarray | None = None
-    final_time: float = 0.0
-    missile_final_course_deg: float = 0.0
-    event: EventState = field(default_factory=EventState)
+class Result:
+    states: list
+    hit: bool
+    hit_index: int
+    hit_time: float
 
-class DirectGuidanceSimulator:
+def _signed_angle(a: np.ndarray, b: np.ndarray) -> float:
+    a = normalize(a)
+    b = normalize(b)
+    dot = float(np.clip(np.dot(a, b), -1.0, 1.0))
+    ang = float(np.arccos(dot))
+    cross = a[0] * b[1] - a[1] * b[0]
+    return ang if cross >= 0.0 else -ang
 
-    def __init__(self, missile, target, params: dict):
-        self.missile = missile
-        self.target = target
-        self.params = dict(params)
-        self.time = 0.0
-        self.finished = False
-        self.history = SimHistory()
+def simulate_direct(missile_pos, missile_speed, missile_course_dir, target_pos, target_speed, target_course_dir,
+                    wind, dt, hit_threshold, t_max, max_normal_acc):
+    states = []
+    t = 0.0
+    mp = missile_pos.copy()
+    tp = target_pos.copy()
 
-        # Опорные параметры траектории цели
-        self.target_ref_pos = target.pos.copy()
-        self.target_base_speed = norm(target.vel)
-        if self.target_base_speed > 1e-9:
-            self.target_longitudinal = normalize(target.vel)
+    mdir = normalize(missile_course_dir)
+    tdir = normalize(target_course_dir)
+
+    tv_air = tdir * target_speed
+    hit = False
+    hit_idx = -1
+    hit_time = t_max
+
+    while t <= t_max:
+        los = tp - mp
+        d = norm(los)
+        los_dir = normalize(los)
+
+        # Ограничение скорости поворота по максимальной перегрузке:
+        # a_n = V * omega -> omega_max = a_n_max / V
+        if missile_speed > 1e-9 and max_normal_acc > 0.0:
+            ang_to_los = _signed_angle(mdir, los_dir)
+            omega_max = max_normal_acc / missile_speed
+            max_turn = omega_max * dt
+            if abs(ang_to_los) <= max_turn:
+                mdir = los_dir
+            else:
+                turn = np.sign(ang_to_los) * max_turn
+                c = float(np.cos(turn))
+                s = float(np.sin(turn))
+                rot = np.array([[c, -s], [s, c]], dtype=float)
+                mdir = normalize(rot @ mdir)
         else:
-            self.target_longitudinal = np.array([1.0, 0.0], dtype=float)
-        self.target_normal = np.array(
-            [-self.target_longitudinal[1], self.target_longitudinal[0]],
-            dtype=float
-        )
+            mdir = los_dir
 
-        # Продольная координата вдоль опорной оси для синусоидальной траектории
-        self.target_u = 0.0
+        missile_air = mdir * missile_speed
+        missile_ground = missile_air + wind
+        target_ground = tv_air + wind
 
-        self._record()
-    def replace_runtime_parameters(self, params: dict) -> None:
-        self.params.update(params)
+        horiz = np.array([1.0, 0.0], dtype=float)
+        eps_deg = np.degrees(_signed_angle(horiz, los_dir))
+        theta_deg = np.degrees(_signed_angle(horiz, mdir))
+        jc_deg = theta_deg - eps_deg
 
-    def _record(self) -> None:
-        rel = self.target.pos - self.missile.pos
-        d = norm(rel)
-        wind = np.array(self.params["wind"], dtype=float)
-        self.history.t.append(self.time)
-        self.history.missile_pos.append(self.missile.pos.copy())
-        self.history.target_pos.append(self.target.pos.copy())
-        self.history.missile_air_vel.append(self.missile.vel.copy())
-        self.history.missile_ground_vel.append((self.missile.vel + wind).copy())
-        self.history.target_vel.append(self.target.vel.copy())
-        self.history.distance.append(d)
-        if d < self.history.min_distance:
-            self.history.min_distance = d
-            self.history.min_distance_time = self.time
-            self.history.min_distance_missile_pos = self.missile.pos.copy()
-
-
-    def _target_motion_update(self, dt: float):
-        mode = self.params.get("target_motion_mode", "stationary")
-
-        if mode == "stationary":
-            self.target.vel = np.array([0.0, 0.0], dtype=float)
-            self.target.acc = np.array([0.0, 0.0], dtype=float)
-            return False
-
-        if mode == "uniform":
-            if not self.params.get("target_override_acc", False):
-                self.target.acc = np.array([0.0, 0.0], dtype=float)
-            return False
-
-        if mode == "accelerated":
-            if not self.params.get("target_override_acc", False):
-                if np.any(self.target.acc):
-                    self.target.vel = self.target.vel + self.target.acc * dt
-            return False
-
-        if mode == "sinusoidal":
-            # Цель движется по гладкой синусоидальной траектории с ПОСТОЯННЫМ модулем скорости.
-            # Радиус синуса влияет на геометрию траектории, но не увеличивает модуль скорости.
-            radius = float(self.params.get("target_sine_radius", 1500.0))
-            k = float(self.params.get("target_sine_k", 0.0012))  # пространственная частота, рад/м
-            phase = float(self.params.get("target_sine_phase", 0.0))
-            vmag = max(self.target_base_speed, 1e-9)
-
-            arg = k * self.target_u + phase
-            slope = radius * k * np.cos(arg)              # dw/du
-            ds_du = np.sqrt(1.0 + slope * slope)          # ds/du
-            du_dt = vmag / ds_du                          # обеспечивает |v| = const
-
-            self.target_u += du_dt * dt
-            arg = k * self.target_u + phase
-            w = radius * np.sin(arg)
-            slope = radius * k * np.cos(arg)
-            curv2 = -radius * k * k * np.sin(arg)         # d2w/du2
-
-            # Положение на синусоидальной линии в базисе (e, n)
-            self.target.pos = self.target_ref_pos + self.target_longitudinal * self.target_u + self.target_normal * w
-
-            # Скорость в мировых координатах
-            vel = (self.target_longitudinal + self.target_normal * slope) * du_dt
-            self.target.vel = vel
-
-            # Приближенное ускорение для отображения
-            d_du_dt = -(vmag * curv2 * slope) / ((1.0 + slope * slope) ** 2)
-            acc = (self.target_longitudinal + self.target_normal * slope) * d_du_dt + self.target_normal * curv2 * (du_dt ** 2)
-            self.target.acc = acc
-            return True
-
-        return False
-    def step(self) -> None:
-        if self.finished:
-            return
-
-        dt = float(self.params["dt"])
-        hit_threshold = float(self.params["hit_threshold"])
-        missile_speed = float(self.params["missile_speed"])
-        a_n_max = float(self.params.get("missile_max_normal_acc", 1e9))
-
-        rel = self.target.pos - self.missile.pos
-        d = norm(rel)
+        states.append(State(
+            mp.copy(), missile_air.copy(), missile_ground.copy(),
+            tp.copy(), target_ground.copy(), d, t,
+            theta_deg, eps_deg, jc_deg
+        ))
 
         if d <= hit_threshold:
-            self.finished = True
-            self.history.event = EventState(True, True, False, self.time, d, "Попадание")
-            self.history.final_time = self.time
-            self.history.missile_final_course_deg = angle_deg(self.missile.vel)
-            return
+            hit = True
+            hit_idx = len(states) - 1
+            hit_time = t
+            break
 
-        los_hat = normalize(rel)
-        current_dir = normalize(self.missile.vel)
-        if norm(current_dir) < 1e-12:
-            current_dir = los_hat.copy()
+        mp = mp + missile_ground * dt
+        tp = tp + target_ground * dt
+        t += dt
 
-        desired_dir = los_hat
-        dot_cd = float(np.clip(np.dot(current_dir, desired_dir), -1.0, 1.0))
-        ang = float(np.arccos(dot_cd))
-        cross_z = current_dir[0] * desired_dir[1] - current_dir[1] * desired_dir[0]
-        if cross_z > 0.0:
-            sign = 1.0
-        elif cross_z < 0.0:
-            sign = -1.0
-        else:
-            sign = 0.0
+    if not states:
+        states.append(State(
+            missile_pos.copy(), np.zeros(2), np.zeros(2),
+            target_pos.copy(), tv_air.copy() + wind, norm(target_pos - missile_pos), 0.0,
+            0.0, 0.0, 0.0
+        ))
+    return Result(states, hit, hit_idx, hit_time)
 
-        omega_max = a_n_max / max(missile_speed, 1e-9)
-        max_turn = omega_max * dt
-
-        if ang > max_turn and max_turn > 0.0:
-            turn = sign * max_turn
-            c = float(np.cos(turn))
-            s = float(np.sin(turn))
-            rot = np.array([[c, -s], [s, c]], dtype=float)
-            new_dir = normalize(rot @ current_dir)
-        else:
-            new_dir = desired_dir
-
-        self.missile.vel = new_dir * missile_speed
-
-        wind = np.array(self.params["wind"], dtype=float)
-        missile_ground_vel = self.missile.vel + wind
-
-        target_position_already_set = self._target_motion_update(dt)
-        target_ground_vel = self.target.vel + wind
-
-        if target_position_already_set:
-            # Для синусоидального режима аналитическое положение уже задано;
-            # добавляем только снос среды.
-            self.target.pos = self.target.pos + wind * dt
-        else:
-            self.target.pos = self.target.pos + target_ground_vel * dt
-
-        self.missile.pos = self.missile.pos + missile_ground_vel * dt
-
-        self.time += dt
-        self._record()
-
-        d_new = self.history.distance[-1]
-        if d_new <= hit_threshold:
-            self.finished = True
-            self.history.event = EventState(True, True, False, self.time, d_new, "Попадание")
-            self.history.final_time = self.time
-            self.history.missile_final_course_deg = angle_deg(self.missile.vel)
-            return
-
-        if self.time >= float(self.params["t_max"]) and not self.finished:
-            self.finished = True
-            self.history.event = EventState(False, False, False, self.time, d_new, "Достигнуто t_max")
-
-        self.history.final_time = self.time
-        self.history.missile_final_course_deg = angle_deg(self.missile.vel)
+def make_equal_parts(result: Result, parts: int):
+    missile_points = np.array([s.missile_pos for s in result.states], dtype=float)
+    sampled_missile, idx = resample_polyline(missile_points, parts + 1)
+    sampled_target = np.array([result.states[min(i, len(result.states)-1)].target_pos for i in idx], dtype=float)
+    sampled_times = np.array([result.states[min(i, len(result.states)-1)].time for i in idx], dtype=float)
+    sampled_state_idx = np.array([min(i, len(result.states)-1) for i in idx], dtype=int)
+    return sampled_missile, sampled_target, sampled_times, sampled_state_idx

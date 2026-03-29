@@ -2,718 +2,360 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import ttk, messagebox
 import numpy as np
-import math
-import random
 import matplotlib
 matplotlib.use("TkAgg")
-import matplotlib.patches as patches
-from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+from matplotlib.patches import Arc, RegularPolygon
 
-from config import DEFAULT_VALUES, GUIDANCE_METHODS, MODES, SCENARIOS
-from core.entities import BodyState
-from core.math2d import vec, from_angle_deg, normalize, perp, norm
-from core.simulator import DirectGuidanceSimulator
-
-TRAJ_MISSILE_COLOR = "black"
-TRAJ_TARGET_COLOR = "red"
-VECTOR_COLOR = "#1f77b4"
-REPLACE_BG = "#fff2a8"
+from core.math2d import vec, normalize, norm, signed_angle_deg, from_deg
+from core.simulator import simulate_direct, make_equal_parts
 
 class MainWindow(tk.Frame):
     def __init__(self, master):
         super().__init__(master)
         self.vars = {}
-        self.replace_vars = {}
-        self.info_var = tk.StringVar(value="Готов к расчету")
-        self.pause_info_var = tk.StringVar(value="")
-        self.sim = None
-        self.paused = False
-        self.after_id = None
-        self.locked_widgets = []
-        self.start_button = None
-        self.started = False
-        self.slider_vars = {}
-        self.slider_value_labels = {}
-        self.slider_scales = {}
-        self.current_target_motion_mode = "stationary"
-        self.sine_params = None
+        self.result = None
+        self.sampled_missile = None
+        self.sampled_target = None
+        self.sampled_times = None
+        self.sampled_state_idx = None
+        self.current_step = 0
+        self.zoom_mode = False
+        self.zoom_factor_var = tk.DoubleVar(value=2.0)
         self._build_ui()
-        self._apply_values(DEFAULT_VALUES)
-        self._apply_scenario_values("Цель стоит")
-        self._apply_replace_defaults()
-        self._draw_empty()
-
-
-    def _add_live_slider(self, parent, row, key, label, from_, to_):
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=1)
-        var = tk.DoubleVar(value=0.0)
-        self.slider_vars[key] = var
-        scale = tk.Scale(
-            parent,
-            variable=var,
-            from_=from_,
-            to=to_,
-            orient="horizontal",
-            resolution=0.1,
-            showvalue=False,
-            length=155,
-            command=lambda value, k=key: self._on_slider_change(k, float(value)),
-        )
-        scale.grid(row=row, column=1, columnspan=2, sticky="ew", pady=1)
-        lbl = ttk.Label(parent, text="0.0")
-        lbl.grid(row=row, column=3, sticky="w", padx=(6, 0))
-        self.slider_value_labels[key] = lbl
-        self.slider_scales[key] = scale
-        return row + 1
-
-    def _set_slider_value(self, key, value):
-        if key in self.slider_vars:
-            self.slider_vars[key].set(float(value))
-        if key in self.slider_value_labels:
-            self.slider_value_labels[key].configure(text=f"{float(value):.2f}")
-
-    def _sync_sliders_from_model(self):
-        if self.sim is None:
-            return
-        wind = np.array(self.sim.params["wind"], dtype=float)
-        self._set_slider_value("missile_speed", self.sim.params.get("missile_speed", norm(self.sim.missile.vel)))
-        self._set_slider_value("target_vx", self.sim.target.vel[0])
-        self._set_slider_value("target_vz", self.sim.target.vel[1])
-        self._set_slider_value("target_ax", self.sim.target.acc[0])
-        self._set_slider_value("target_az", self.sim.target.acc[1])
-        self._set_slider_value("wind_x", wind[0])
-        self._set_slider_value("wind_z", wind[1])
-        if "target_sine_radius" in self.sim.params:
-            self._set_slider_value("target_sine_radius", self.sim.params["target_sine_radius"])
-
-
-    def _on_slider_change(self, key, value):
-        self._set_slider_value(key, value)
-        if self.sim is None:
-            return
-
-        if key == "missile_speed":
-            cur = normalize(self.sim.missile.vel)
-            if norm(cur) < 1e-9:
-                cur = from_angle_deg(self._f("missile_course_deg"))
-            self.sim.missile.vel = cur * value
-            self.sim.params["missile_speed"] = value
-
-        elif key == "target_vx":
-            self.sim.target.vel[0] = value
-            self.sim.params["target_override_vel"] = True
-        elif key == "target_vz":
-            self.sim.target.vel[1] = value
-            self.sim.params["target_override_vel"] = True
-        elif key == "target_ax":
-            self.sim.target.acc[0] = value
-            self.sim.params["target_override_acc"] = True
-        elif key == "target_az":
-            self.sim.target.acc[1] = value
-            self.sim.params["target_override_acc"] = True
-        elif key == "wind_x":
-            self.sim.params["wind"][0] = value
-        elif key == "wind_z":
-            self.sim.params["wind"][1] = value
-
-        self._render(True)
-
 
     def _build_ui(self):
-        paned = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
-        paned.pack(fill="both", expand=True)
+        self.columnconfigure(1, weight=1)
+        self.rowconfigure(0, weight=1)
 
-        # Левая область со скроллингом
-        self.left_container = ttk.Frame(paned)
-        self.right_panel = ttk.Frame(paned, padding=8)
-        paned.add(self.left_container, weight=0)
-        paned.add(self.right_panel, weight=1)
+        left = ttk.Frame(self, padding=10)
+        left.grid(row=0, column=0, sticky="nsw")
+        left.columnconfigure(1, weight=1)
 
-        self.left_container.configure(width=650)
-        self.left_container.pack_propagate(False)
+        right = ttk.Frame(self, padding=10)
+        right.grid(row=0, column=1, sticky="nsew")
+        right.rowconfigure(0, weight=1)
+        right.columnconfigure(0, weight=1)
 
-        self.left_canvas = tk.Canvas(self.left_container, highlightthickness=0)
-        self.left_scrollbar = ttk.Scrollbar(self.left_container, orient="vertical", command=self.left_canvas.yview)
-        self.left_canvas.configure(yscrollcommand=self.left_scrollbar.set)
-
-        self.left_scrollbar.pack(side="right", fill="y")
-        self.left_canvas.pack(side="left", fill="both", expand=True)
-
-        self.left_panel = ttk.Frame(self.left_canvas, padding=8)
-        self.left_window_id = self.left_canvas.create_window((0, 0), window=self.left_panel, anchor="nw")
-
-        def _on_left_configure(event=None):
-            self.left_canvas.configure(scrollregion=self.left_canvas.bbox("all"))
-
-        def _on_canvas_configure(event):
-            self.left_canvas.itemconfigure(self.left_window_id, width=event.width)
-
-        self.left_panel.bind("<Configure>", _on_left_configure)
-        self.left_canvas.bind("<Configure>", _on_canvas_configure)
-
-        # Колесо мыши над левой панелью
-        def _on_mousewheel(event):
-            self.left_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        self.left_canvas.bind_all("<MouseWheel>", _on_mousewheel)
-
-        self._build_left()
-        self._build_right()
-    def _build_left(self):
-        p = self.left_panel
-        p.columnconfigure(1, weight=1)
-        p.columnconfigure(2, weight=1)
-        p.columnconfigure(3, weight=0)
         row = 0
-
-        def combo(label, values, key, default):
+        def entry(key, label, value):
             nonlocal row
-            ttk.Label(p, text=label).grid(row=row, column=0, sticky="w", pady=2)
-            var = tk.StringVar(value=default)
-            self.vars[key] = var
-            cb = ttk.Combobox(p, textvariable=var, values=values, state="readonly", width=24)
-            cb.grid(row=row, column=1, columnspan=2, sticky="ew", pady=2)
-            self.locked_widgets.append(cb)
-            row += 1
-            return cb
-
-        def sep(title):
-            nonlocal row
-            ttk.Separator(p, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=(8, 6))
-            row += 1
-            ttk.Label(p, text=title).grid(row=row, column=0, columnspan=3, sticky="w")
+            ttk.Label(left, text=label).grid(row=row, column=0, sticky="w", pady=2)
+            self.vars[key] = tk.StringVar(value=value)
+            ttk.Entry(left, textvariable=self.vars[key], width=18).grid(row=row, column=1, sticky="ew", pady=2)
             row += 1
 
-        def entry(key, label, replace_key=None):
-            nonlocal row
-            ttk.Label(p, text=label).grid(row=row, column=0, sticky="w", pady=1)
-            var = tk.StringVar()
-            self.vars[key] = var
-            e = ttk.Entry(p, textvariable=var, width=14)
-            e.grid(row=row, column=1, sticky="ew", pady=1)
-            self.locked_widgets.append(e)
-
-            if replace_key is not None:
-                rvar = tk.StringVar()
-                self.replace_vars[replace_key] = rvar
-                re = tk.Entry(p, textvariable=rvar, width=14, bg=REPLACE_BG)
-                re.grid(row=row, column=2, sticky="ew", pady=1, padx=(8,0))
-            else:
-                ttk.Label(p, text="").grid(row=row, column=2, sticky="ew")
-            row += 1
-
-        combo("Метод наведения", GUIDANCE_METHODS, "guidance_method", GUIDANCE_METHODS[0])
-        combo("Режим", MODES, "mode", MODES[1])
-        cb = combo("Сценарий", SCENARIOS, "scenario", SCENARIOS[0])
-        cb.bind("<<ComboboxSelected>>", self._on_scenario)
-
-        sep("ОУ")
-        entry("missile_x", "x, м")
-        entry("missile_z", "z, м")
-        entry("missile_speed", "скорость, м/с", "missile_speed_new")
-        entry("missile_course_deg", "курс, град")
-        entry("missile_max_normal_acc", "a_n max, м/с²")
-
-        sep("ОС")
-        entry("target_x", "x, м")
-        entry("target_z", "z, м")
-        entry("target_vx", "Vx, м/с", "target_vx_new")
-        entry("target_vz", "Vz, м/с", "target_vz_new")
-        entry("target_course_deg", "курс ОС, град")
-        entry("target_ax", "ax, м/с²", "target_ax_new")
-        entry("target_az", "az, м/с²", "target_az_new")
-
-        sep("Среда и расчет")
-        entry("wind_x", "ветер x, м/с", "wind_x_new")
-        entry("wind_z", "ветер z, м/с", "wind_z_new")
-        entry("dt", "шаг dt, с")
-        entry("t_max", "t_max, с")
-        entry("hit_threshold", "порог, м")
-        entry("steps_per_frame", "шагов за кадр")
-        entry("frame_delay_ms", "задержка кадра, мс")
-        entry("target_sine_radius", "радиус синуса, м")
-
-
-        ttk.Label(p, text="Желтые поля справа: можно менять только скорости, ускорения и ветер в паузе").grid(
-            row=row, column=0, columnspan=4, sticky="w", pady=(8, 0)
-        )
+        ttk.Label(left, text="Метод прямого наведения", font=("TkDefaultFont", 11, "bold")).grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+        ttk.Separator(left, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=6)
         row += 1
 
-        ttk.Separator(p, orient="horizontal").grid(row=row, column=0, columnspan=4, sticky="ew", pady=(6, 4))
-        row += 1
-        ttk.Label(p, text="Слайдеры для изменения в паузе").grid(row=row, column=0, columnspan=4, sticky="w")
-        row += 1
+        ttk.Label(left, text="ОУ").grid(row=row, column=0, columnspan=2, sticky="w"); row += 1
+        entry("mx", "x ОУ, м", "-12000")
+        entry("mz", "z ОУ, м", "-4000")
+        entry("mspeed", "V ОУ, м/с", "450")
+        entry("mcourse", "курс ОУ, град", "20")
+        entry("man", "a_n max, м/с²", "80")
 
-        row = self._add_live_slider(p, row, "missile_speed", "V ОУ, м/с", 50.0, 1500.0)
-        row = self._add_live_slider(p, row, "target_vx", "Vx ОС, м/с", -500.0, 500.0)
-        row = self._add_live_slider(p, row, "target_vz", "Vz ОС, м/с", -500.0, 500.0)
-        row = self._add_live_slider(p, row, "target_ax", "ax ОС, м/с²", -30.0, 30.0)
-        row = self._add_live_slider(p, row, "target_az", "az ОС, м/с²", -30.0, 30.0)
-        row = self._add_live_slider(p, row, "wind_x", "ветер x, м/с", -150.0, 150.0)
-        row = self._add_live_slider(p, row, "wind_z", "ветер z, м/с", -150.0, 150.0)
-        
-        btn = ttk.Frame(p)
-        btn.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        ttk.Separator(left, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=6); row += 1
+        ttk.Label(left, text="ОС").grid(row=row, column=0, columnspan=2, sticky="w"); row += 1
+        entry("tx", "x ОС, м", "0")
+        entry("tz", "z ОС, м", "0")
+        entry("tspeed", "V ОС, м/с", "120")
+        entry("tcourse", "курс ОС, град", "0")
+
+        ttk.Separator(left, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=6); row += 1
+        ttk.Label(left, text="Параметры расчета").grid(row=row, column=0, columnspan=2, sticky="w"); row += 1
+        entry("windx", "ветер x, м/с", "0")
+        entry("windz", "ветер z, м/с", "0")
+        entry("dt", "dt моделирования, с", "0.05")
+        entry("tmax", "t_max, с", "120")
+        entry("hit", "порог контакта, м", "25")
+        entry("parts", "число равных частей", "12")
+
+        btns = ttk.Frame(left)
+        btns.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(10, 6))
         for i in range(5):
-            btn.columnconfigure(i, weight=1)
-        self.start_button = ttk.Button(btn, text="Старт", command=self.start)
-        self.start_button.grid(row=0, column=0, sticky="ew", padx=2)
-        ttk.Button(btn, text="Пауза", command=self.pause).grid(row=0, column=1, sticky="ew", padx=2)
-        ttk.Button(btn, text="Продолжить", command=self.resume).grid(row=0, column=2, sticky="ew", padx=2)
-        ttk.Button(btn, text="Заменить", command=self.replace_parameters).grid(row=0, column=3, sticky="ew", padx=2)
-        ttk.Button(btn, text="Очистить", command=self.clear_plots).grid(row=0, column=4, sticky="ew", padx=2)
+            btns.columnconfigure(i, weight=1)
+        ttk.Button(btns, text="Построить траекторию", command=self.build_trajectory).grid(row=0, column=0, sticky="ew", padx=2)
+        self.btn_prev = ttk.Button(btns, text="Назад", command=self.prev_step, state="disabled")
+        self.btn_prev.grid(row=0, column=1, sticky="ew", padx=2)
+        self.btn_next = ttk.Button(btns, text="Вперед", command=self.next_step, state="disabled")
+        self.btn_next.grid(row=0, column=2, sticky="ew", padx=2)
+        self.btn_zoom = ttk.Button(btns, text="Приблизить", command=self.toggle_zoom, state="disabled")
+        self.btn_zoom.grid(row=0, column=3, sticky="ew", padx=2)
+        ttk.Button(btns, text="Очистить", command=self.clear_all).grid(row=0, column=4, sticky="ew", padx=2)
         row += 1
 
-        ttk.Label(p, textvariable=self.info_var, justify="left", wraplength=500).grid(
-            row=row, column=0, columnspan=3, sticky="ew", pady=(12, 0)
+        self.info = tk.StringVar(
+            value="Введите начальные координаты, скорости, курсы и максимальную перегрузку. "
+                  "После построения кнопки «Назад/Вперед» показывают один шаг графоаналитического построения."
         )
+        ttk.Label(left, textvariable=self.info, justify="left", wraplength=380).grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
-    def _build_right(self):
-        self.right_panel.rowconfigure(0, weight=1)
-        self.right_panel.columnconfigure(0, weight=1)
-        self.right_panel.columnconfigure(1, weight=0)
-        self.figure = Figure(figsize=(10, 8), dpi=100)
-        self.ax_traj = self.figure.add_subplot(211)
-        self.ax_dist = self.figure.add_subplot(212)
-        self.figure.subplots_adjust(left=0.08, right=0.98, top=0.95, bottom=0.07, hspace=0.38)
-        self.canvas = FigureCanvasTkAgg(self.figure, master=self.right_panel)
+        self.fig = Figure(figsize=(10, 8), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_title("Пошаговое графическое построение метода прямого наведения")
+        self.ax.set_xlabel("x, м")
+        self.ax.set_ylabel("z, м")
+        self.ax.grid(True)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=right)
         self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
-        ttk.Label(self.right_panel, textvariable=self.pause_info_var, justify="left", wraplength=220).grid(
-            row=0, column=1, sticky="ne", padx=(10,0), pady=(10,0)
+
+        zoom_box = ttk.LabelFrame(right, text="Приближение", padding=8)
+        zoom_box.grid(row=0, column=1, sticky="ns", padx=(10, 0))
+        ttk.Label(zoom_box, text="Масштаб").grid(row=0, column=0, sticky="w")
+        self.zoom_scale = tk.Scale(
+            zoom_box,
+            from_=1.0,
+            to=15.0,
+            resolution=0.1,
+            orient="vertical",
+            variable=self.zoom_factor_var,
+            command=lambda _v: self._on_zoom_change(),
+            length=240,
         )
-
-    def _random_realistic_velocity(self):
-        speed = random.uniform(120.0, 320.0)
-        angle = random.uniform(-35.0, 35.0)
-        v = from_angle_deg(angle) * speed
-        return float(v[0]), float(v[1]), float(angle)
-
-    def _random_realistic_acceleration(self):
-        return random.uniform(-12.0, 12.0), random.uniform(-12.0, 12.0)
+        self.zoom_scale.grid(row=1, column=0, sticky="ns")
 
 
-    def _apply_scenario_values(self, scenario_name: str):
-        vals = dict(DEFAULT_VALUES)
-        vals["target_x"] = 0.0
-        vals["target_z"] = 0.0
-        vals["target_course_deg"] = 0.0
-        vals["target_sine_radius"] = 1500.0
-        self.current_target_motion_mode = "stationary"
-        self.sine_params = None
+    def _on_zoom_change(self):
+        if self.result is not None and self.zoom_mode:
+            self._draw_step(self.current_step)
 
-        if scenario_name == "Цель стоит":
-            vals["target_vx"] = 0.0
-            vals["target_vz"] = 0.0
-            vals["target_ax"] = 0.0
-            vals["target_az"] = 0.0
-            vals["t_max"] = 60.0
-            self.current_target_motion_mode = "stationary"
-
-        elif scenario_name == "Цель движется равномерно":
-            vx, vz, course = self._random_realistic_velocity()
-            vals["target_vx"] = vx
-            vals["target_vz"] = vz
-            vals["target_course_deg"] = course
-            vals["target_ax"] = 0.0
-            vals["target_az"] = 0.0
-            vals["t_max"] = 80.0
-            self.current_target_motion_mode = "uniform"
-
-        elif scenario_name == "Цель движется равноускоренно":
-            vx, vz, course = self._random_realistic_velocity()
-            ax, az = self._random_realistic_acceleration()
-            vals["target_vx"] = vx
-            vals["target_vz"] = vz
-            vals["target_course_deg"] = course
-            vals["target_ax"] = ax
-            vals["target_az"] = az
-            vals["t_max"] = 80.0
-            self.current_target_motion_mode = "accelerated"
-
-        elif scenario_name == "Цель маневрирует по синусу":
-            vx, vz, course = self._random_realistic_velocity()
-            radius = random.uniform(800.0, 3000.0)
-            k = random.uniform(0.0006, 0.0018)
-            vals["target_vx"] = vx
-            vals["target_vz"] = vz
-            vals["target_course_deg"] = course
-            vals["target_ax"] = 0.0
-            vals["target_az"] = 0.0
-            vals["target_sine_radius"] = radius
-            vals["t_max"] = 80.0
-            self.current_target_motion_mode = "sinusoidal"
-            self.sine_params = {
-                "target_base_acc": np.array([0.0, 0.0], dtype=float),
-                "target_sine_acc_amp": np.array([radius * omega * omega, radius * omega * omega], dtype=float),
-                "target_sine_omega": omega,
-                "target_sine_phase": random.uniform(0.0, 2.0 * math.pi),
-            }
-
-        self._apply_values(vals)
-    def _set_initial_locked(self, locked: bool):
-        state = "disabled" if locked else "normal"
-        combo_state = "disabled" if locked else "readonly"
-        for w in self.locked_widgets:
-            if isinstance(w, ttk.Combobox):
-                w.configure(state=combo_state)
-            else:
-                w.configure(state=state)
-
-    def _on_scenario(self, event=None):
-        self._apply_scenario_values(self.vars["scenario"].get())
-        self._apply_replace_defaults()
-
-    def _apply_values(self, values):
-        for k, v in values.items():
-            if k in self.vars:
-                self.vars[k].set(str(round(v, 3) if isinstance(v, float) else v))
-
-
-    def _apply_replace_defaults(self):
-        mapping = {
-            "missile_speed_new": "missile_speed",
-            "target_vx_new": "target_vx",
-            "target_vz_new": "target_vz",
-            "target_ax_new": "target_ax",
-            "target_az_new": "target_az",
-            "wind_x_new": "wind_x",
-            "wind_z_new": "wind_z",
-        }
-        for rk, bk in mapping.items():
-            if rk in self.replace_vars and bk in self.vars:
-                self.replace_vars[rk].set(self.vars[bk].get())
     def _f(self, key):
-        return float(self.vars[key].get().strip().replace(",", "."))
+        return float(self.vars[key].get().replace(",", ".").strip())
 
-    def _fr(self, key):
-        return float(self.replace_vars[key].get().strip().replace(",", "."))
+    def _update_nav_buttons(self):
+        if self.result is None:
+            self.btn_prev.configure(state="disabled")
+            self.btn_next.configure(state="disabled")
+            self.btn_zoom.configure(state="disabled")
+            return
+        last_idx = len(self.sampled_missile) - 1
+        self.btn_prev.configure(state=("normal" if self.current_step > 0 else "disabled"))
+        self.btn_next.configure(state=("normal" if self.current_step < last_idx else "disabled"))
+        self.btn_zoom.configure(state="normal")
 
-
-    def _runtime_params(self):
-        params = {
-            "missile_speed": self._f("missile_speed"),
-            "missile_max_normal_acc": self._f("missile_max_normal_acc"),
-            "wind": vec(self._f("wind_x"), self._f("wind_z")),
-            "dt": self._f("dt"),
-            "t_max": self._f("t_max"),
-            "hit_threshold": self._f("hit_threshold"),
-            "target_motion_mode": self.current_target_motion_mode,
-        }
-        if self.sine_params is not None:
-            radius = self._f("target_sine_radius")
-            omega = float(self.sine_params.get("target_sine_omega", 0.5))
-            phase = float(self.sine_params.get("target_sine_phase", 0.0))
-            params.update({
-                "target_base_acc": np.array([0.0, 0.0], dtype=float),
-                "target_sine_acc_amp": np.array([radius * omega * omega, radius * omega * omega], dtype=float),
-                "target_sine_omega": omega,
-                "target_sine_phase": phase,
-            })
-        return params
-
-    def _build_states(self):
-        missile = BodyState(
-            pos=vec(self._f("missile_x"), self._f("missile_z")),
-            vel=from_angle_deg(self._f("missile_course_deg")) * self._f("missile_speed"),
-            acc=vec(0.0, 0.0),
-        )
-
-        tv_raw = vec(self._f("target_vx"), self._f("target_vz"))
-        tv_mag = norm(tv_raw)
-        tcourse = self._f("target_course_deg")
-        if tv_mag > 1e-9:
-            tv = from_angle_deg(tcourse) * tv_mag
-        else:
-            tv = vec(0.0, 0.0)
-
-        target = BodyState(
-            pos=vec(self._f("target_x"), self._f("target_z")),
-            vel=tv,
-            acc=vec(self._f("target_ax"), self._f("target_az")),
-        )
-        return missile, target, self._runtime_params()
-    def _cancel_after(self):
-        if self.after_id is not None:
-            try:
-                self.after_cancel(self.after_id)
-            except Exception:
-                pass
-            self.after_id = None
-
-    def start(self):
+    def build_trajectory(self):
         try:
-            self._cancel_after()
-            self.paused = False
-            missile, target, params = self._build_states()
-            self.sim = DirectGuidanceSimulator(missile, target, params)
-            self._set_initial_locked(True)
-            self.started = True
-            if self.start_button is not None:
-                self.start_button.configure(state="disabled")
-            self._sync_sliders_from_model()
-            if self.vars["mode"].get() == "Полный расчет":
-                while self.sim is not None and not self.sim.finished:
-                    self.sim.step()
-                self._render(False)
-            else:
-                self._animate_tick()
+            missile_pos = vec(self._f("mx"), self._f("mz"))
+            missile_speed = self._f("mspeed")
+            missile_course = from_deg(self._f("mcourse"))
+            max_normal_acc = self._f("man")
+
+            target_pos = vec(self._f("tx"), self._f("tz"))
+            target_speed = self._f("tspeed")
+            target_course = from_deg(self._f("tcourse"))
+
+            wind = vec(self._f("windx"), self._f("windz"))
+            dt = self._f("dt")
+            tmax = self._f("tmax")
+            hit = self._f("hit")
+            parts = int(round(self._f("parts")))
+            if parts < 1:
+                raise ValueError("Число равных частей должно быть не меньше 1.")
+
+            self.result = simulate_direct(
+                missile_pos=missile_pos,
+                missile_speed=missile_speed,
+                missile_course_dir=missile_course,
+                target_pos=target_pos,
+                target_speed=target_speed,
+                target_course_dir=target_course,
+                wind=wind,
+                dt=dt,
+                hit_threshold=hit,
+                t_max=tmax,
+                max_normal_acc=max_normal_acc,
+            )
+            self.sampled_missile, self.sampled_target, self.sampled_times, self.sampled_state_idx = make_equal_parts(self.result, parts)
+            self.current_step = 0
+            self.zoom_mode = False
+            self.btn_zoom.configure(text="Приблизить")
+            self._draw_step(self.current_step)
+            self._update_nav_buttons()
+
+            status = f"Контакт достигнут, t = {self.result.hit_time:.2f} с." if self.result.hit else "Контакт не достигнут на интервале моделирования."
+            self.info.set(
+                f"Траектория построена и разбита на {parts} равных частей. {status} "
+                f"Различение линий усилено: траектория ОУ — черная сплошная, ОС — красная сплошная, "
+                f"ЛВ — оранжевая, OX1 — черная утолщенная, Vп — синяя."
+            )
         except Exception as exc:
             messagebox.showerror("Ошибка", str(exc))
 
-    def pause(self):
-        self.paused = True
-        self._cancel_after()
-        self._sync_sliders_from_model()
-        self._render(True)
-
-    def resume(self):
-        if self.sim is None:
+    def _set_view_limits(self, state, p, c):
+        if not self.zoom_mode:
+            missile_path = np.array([s.missile_pos for s in self.result.states], dtype=float)
+            target_path = np.array([s.target_pos for s in self.result.states], dtype=float)
+            allp = np.vstack([missile_path, target_path])
+            xmin, ymin = np.min(allp, axis=0)
+            xmax, ymax = np.max(allp, axis=0)
+            dx = max(xmax - xmin, 1.0)
+            dy = max(ymax - ymin, 1.0)
+            self.ax.set_xlim(xmin - 0.08 * dx, xmax + 0.08 * dx)
+            self.ax.set_ylim(ymin - 0.12 * dy, ymax + 0.12 * dy)
             return
-        if self.sim.finished:
-            self._render(False)
+
+        # Приближенный режим: окно центрируется на ОУ
+        vp = state.missile_ground_vel
+        vt = state.target_ground_vel
+        los = c - p
+
+        # В режиме приближения масштаб определяется только бегунком.
+        # Никакого дополнительного автоматического приближения на конечном этапе нет.
+        base_window = 6000.0
+        zoom_factor = max(1.0, float(self.zoom_factor_var.get()))
+        half_window = base_window / zoom_factor
+
+        cx = p[0]
+        cy = p[1]
+        self.ax.set_xlim(cx - half_window, cx + half_window)
+        self.ax.set_ylim(cy - half_window, cy + half_window)
+
+    def _scaled_length(self, v, base_len=900.0, min_len=420.0, max_len=1150.0):
+        vnorm = norm(v)
+        if vnorm < 1e-9:
+            return min_len
+        ref = 250.0
+        scaled = base_len * (vnorm / ref)
+        return max(min_len, min(max_len, scaled))
+
+    def _draw_base(self):
+        self.ax.clear()
+        self.ax.grid(True, alpha=0.45)
+        self.ax.set_title("Пошаговое графическое построение метода прямого наведения")
+        self.ax.set_xlabel("x, м")
+        self.ax.set_ylabel("z, м")
+        if self.result is None:
+            self.canvas.draw()
             return
-        self.paused = False
-        self._animate_tick()
 
+        missile_path = np.array([s.missile_pos for s in self.result.states], dtype=float)
+        target_path = np.array([s.target_pos for s in self.result.states], dtype=float)
 
-    def replace_parameters(self):
-        if self.sim is None:
+        self.ax.plot(missile_path[:, 0], missile_path[:, 1], color="black", linewidth=2.8, label="Траектория ОУ")
+        self.ax.plot(target_path[:, 0], target_path[:, 1], color="red", linewidth=2.4, linestyle="-", label="Траектория ОС")
+        self.ax.plot(self.sampled_missile[:, 0], self.sampled_missile[:, 1], linestyle="None", marker="o", color="black", ms=3, alpha=0.35)
+
+        if self.result.hit:
+            hit_pt = self.result.states[self.result.hit_index].target_pos
+            self.ax.add_patch(RegularPolygon(
+                (hit_pt[0], hit_pt[1]), numVertices=8, radius=180,
+                orientation=0.0, fill=False, edgecolor="black", linewidth=1.8
+            ))
+        self.ax.legend(loc="best")
+        self.ax.set_aspect("equal", adjustable="box")
+
+    def _draw_step(self, step_idx):
+        self._draw_base()
+        if self.result is None:
             return
-        try:
-            if not self.paused:
-                self.pause()
 
-            new_speed = self._fr("missile_speed_new")
-            current_dir = normalize(self.sim.missile.vel)
-            if norm(current_dir) < 1e-9:
-                current_dir = from_angle_deg(self._f("missile_course_deg"))
-            self.sim.missile.vel = current_dir * new_speed
+        step_idx = max(0, min(step_idx, len(self.sampled_missile) - 1))
+        self.current_step = step_idx
+        state = self.result.states[self.sampled_state_idx[step_idx]]
+        p = self.sampled_missile[step_idx]
+        c = self.sampled_target[step_idx]
 
-            self.sim.target.vel = vec(self._fr("target_vx_new"), self._fr("target_vz_new"))
-            self.sim.target.acc = vec(self._fr("target_ax_new"), self._fr("target_az_new"))
+        los = c - p
+        los_dir = normalize(los)
+        ox1_dir = normalize(state.missile_air_vel)
+        vt = state.target_ground_vel.copy()
 
-            new_params = {
-                "missile_speed": new_speed,
-                "missile_max_normal_acc": self._f("missile_max_normal_acc"),
-                "wind": vec(self._fr("wind_x_new"), self._fr("wind_z_new")),
-                "dt": self._f("dt"),
-                "t_max": self._f("t_max"),
-                "hit_threshold": self._f("hit_threshold"),
-            }
-            self.sim.replace_runtime_parameters(new_params)
-            self.info_var.set("Заменены только скорости, ускорения и ветер. Курс, dt, t_max, порог и координаты не изменялись.")
-            self._render(True)
-        except Exception as exc:
-            messagebox.showerror("Ошибка замены параметров", str(exc))
-    def clear_plots(self):
-        self._cancel_after()
-        self.sim = None
-        self.paused = False
-        self.started = False
-        self.pause_info_var.set("")
-        self._set_initial_locked(False)
-        if self.start_button is not None:
-            self.start_button.configure(state="normal")
-        self._draw_empty()
-        for key in list(self.slider_vars.keys()):
-            self._set_slider_value(key, 0.0)
-        self.info_var.set("Очищено")
+        self._set_view_limits(state, p, c)
 
-    def _animate_tick(self):
-        if self.sim is None or self.paused:
-            return
-        steps = max(1, int(round(self._f("steps_per_frame"))))
-        for _ in range(steps):
-            if self.sim.finished:
-                break
-            self.sim.step()
-        self._render(False)
-        if self.sim is not None and not self.sim.finished and not self.paused:
-            self.after_id = self.after(max(1, int(round(self._f("frame_delay_ms")))), self._animate_tick)
+        self.ax.plot([p[0]], [p[1]], "ko", ms=8, zorder=6)
+        self.ax.text(p[0] + 80, p[1] - 120, f"ОУ{step_idx}", color="black", fontsize=11)
+        self.ax.plot([c[0]], [c[1]], "o", color="red", ms=8, zorder=6)
+        self.ax.text(c[0] + 80, c[1] + 80, f"ОС{step_idx}", color="red", fontsize=11)
 
-    def _missile_patch(self, pos: np.ndarray, vel: np.ndarray, size: float) -> patches.Polygon:
-        direction = vel / max(norm(vel), 1e-9)
-        left = np.array([-direction[1], direction[0]])
-        nose = pos + direction * size
-        tail = pos - direction * 0.7 * size
-        p1 = tail + left * 0.25 * size
-        p2 = tail - left * 0.25 * size
-        return patches.Polygon([nose, p1, p2], closed=True, facecolor="black", edgecolor="black", zorder=7)
+        # Горизонт OXg
+        self.ax.plot([p[0] - 1600, p[0] + 2600], [p[1], p[1]], color="0.45", linestyle="--", linewidth=1.1)
+        self.ax.text(p[0] + 2650, p[1] + 20, "OXg", color="0.35", fontsize=10)
 
-    def _aircraft_patch(self, pos: np.ndarray, vel: np.ndarray, size: float) -> patches.Polygon:
-        sp = norm(vel)
-        if sp < 1e-9:
-            direction = np.array([1.0, 0.0], dtype=float)
-        else:
-            direction = vel / sp
-        left = np.array([-direction[1], direction[0]])
-        nose = pos + direction * size
-        tail = pos - direction * 0.7 * size
-        wing_l = pos + left * 0.65 * size
-        wing_r = pos - left * 0.65 * size
-        tail_l = tail + left * 0.25 * size
-        tail_r = tail - left * 0.25 * size
-        pts = [nose, wing_l, pos + direction * 0.05 * size, tail_l, tail, tail_r, pos + direction * 0.05 * size, wing_r]
-        return patches.Polygon(pts, closed=True, facecolor="white", edgecolor="black", linewidth=1.2, zorder=7)
+        # Линия визирования
+        self.ax.plot([p[0], c[0]], [p[1], c[1]], color="#ff8c00", linewidth=2.8, linestyle="-", zorder=4)
+        self.ax.text((p[0] + c[0]) * 0.5, (p[1] + c[1]) * 0.5 + 120, "ЛВ", color="#ff8c00", fontsize=11)
 
-    def _draw_empty(self):
-        self.figure.clear()
-        self.ax_traj = self.figure.add_subplot(211)
-        self.ax_dist = self.figure.add_subplot(212)
-        self.ax_traj.set_title("Траектории в плоскости OXZ")
-        self.ax_traj.set_xlabel("x, м")
-        self.ax_traj.set_ylabel("z, м")
-        self.ax_traj.grid(True)
-        self.ax_traj.set_aspect("auto")
-        self.ax_traj.set_xlim(-1000.0, 1000.0)
-        self.ax_traj.set_ylim(-1000.0, 1000.0)
-        self.ax_dist.set_title("Дальность во времени")
-        self.ax_dist.set_xlabel("t, с")
-        self.ax_dist.set_ylabel("d, м")
-        self.ax_dist.grid(True)
-        self.ax_dist.set_xlim(0.0, 1.0)
-        self.ax_dist.set_ylim(0.0, 1.0)
-        self.figure.subplots_adjust(left=0.08, right=0.98, top=0.95, bottom=0.07, hspace=0.38)
-        self.canvas.draw()
+        # Продольная ось OX1
+        axis_len = self._scaled_length(state.missile_air_vel, base_len=950.0, min_len=520.0, max_len=1200.0)
+        ox1_end = p + ox1_dir * axis_len
+        self.ax.arrow(p[0], p[1], ox1_end[0] - p[0], ox1_end[1] - p[1],
+                      color="black", width=6.0, head_width=70.0, length_includes_head=True, zorder=5)
+        self.ax.text(ox1_end[0] + 50, ox1_end[1] + 35, "OX1", color="black", fontsize=11)
 
-    def _draw_explosion(self, x, z):
-        angles = np.linspace(0.0, 2.0 * np.pi, 12, endpoint=False)
-        x0, x1 = self.ax_traj.get_xlim()
-        z0, z1 = self.ax_traj.get_ylim()
-        span = max(abs(x1 - x0), abs(z1 - z0))
-        scale = max(0.012 * span, 90.0)
-        radii = np.where(np.arange(12) % 2 == 0, scale, 0.45 * scale)
-        points = np.column_stack((x + radii * np.cos(angles), z + radii * np.sin(angles)))
-        patch = patches.Polygon(points, closed=True, facecolor="none", edgecolor="black", linewidth=1.5, zorder=8)
-        self.ax_traj.add_patch(patch)
+        # Скорость цели
+        vt_end = c + normalize(vt) * self._scaled_length(vt, base_len=850.0, min_len=430.0, max_len=1100.0)
+        self.ax.arrow(c[0], c[1], vt_end[0] - c[0], vt_end[1] - c[1],
+                      color="red", width=4.0, head_width=55.0, length_includes_head=True, zorder=5)
+        self.ax.text(vt_end[0] + 40, vt_end[1] + 35, "Vц", color="red", fontsize=11)
 
-    def _draw_icons(self, missile_xy, target_xy):
-        missile_xy = np.array(missile_xy, dtype=float)
-        target_xy = np.array(target_xy, dtype=float)
+        eps = state.eps_deg
+        theta = state.theta_deg
+        jc = state.jc_deg
+        delta = jc
 
-        x0, x1 = self.ax_traj.get_xlim()
-        z0, z1 = self.ax_traj.get_ylim()
-        span = max(abs(x1 - x0), abs(z1 - z0))
-        scale = max(0.012 * span, 90.0)
+        # Обозначения углов рисуются после векторов, чтобы ничто их не закрывало
+        self.ax.add_patch(Arc((p[0], p[1]), 700, 700, angle=0.0,
+                              theta1=min(0, eps), theta2=max(0, eps),
+                              color="#ff8c00", linewidth=1.2, zorder=9))
+        self.ax.text(p[0] + 340, p[1] + 105, "ε", color="#ff8c00", fontsize=12, zorder=10)
 
-        if self.sim is not None:
-            mvel = self.sim.missile.vel + np.array(self.sim.params["wind"], dtype=float)
-            tvel = self.sim.target.vel + np.array(self.sim.params["wind"], dtype=float)
-        else:
-            mvel = np.array([1.0, 0.0], dtype=float)
-            tvel = np.array([1.0, 0.0], dtype=float)
+        self.ax.add_patch(Arc((p[0], p[1]), 500, 500, angle=0.0,
+                              theta1=min(0, theta), theta2=max(0, theta),
+                              color="black", linewidth=1.1, zorder=9))
+        self.ax.text(p[0] + 235, p[1] + 15, "ϑ", color="black", fontsize=12, zorder=10)
 
-        self.ax_traj.add_patch(self._missile_patch(missile_xy, mvel, scale))
-        self.ax_traj.add_patch(self._aircraft_patch(target_xy, tvel, 1.15 * scale))
-
-    def _draw_pause_vectors(self):
-        if self.sim is None:
-            return
-        mp = self.sim.missile.pos.copy()
-        tp = self.sim.target.pos.copy()
-        vg_m = self.sim.missile.vel + np.array(self.sim.params["wind"], dtype=float)
-        vg_t = self.sim.target.vel + np.array(self.sim.params["wind"], dtype=float)
-        mt = normalize(vg_m)
-        mn = perp(mt)
-        tt = normalize(vg_t)
-        tn = perp(tt)
-
-        scale_m = max(200.0, norm(vg_m) * 2.0)
-        scale_t = max(200.0, norm(vg_t) * 2.0)
-
-        self.ax_traj.arrow(mp[0], mp[1], mt[0]*scale_m, mt[1]*scale_m, color=VECTOR_COLOR,
-                           width=12.0, head_width=120.0, length_includes_head=True, zorder=6)
-        self.ax_traj.arrow(mp[0], mp[1], mn[0]*scale_m*0.6, mn[1]*scale_m*0.6, color=VECTOR_COLOR,
-                           width=8.0, head_width=90.0, length_includes_head=True, zorder=6)
-
-        tau_m = mp + mt * scale_m * 1.08
-        nrm_m = mp + mn * scale_m * 0.72
-        self.ax_traj.text(tau_m[0], tau_m[1], "τ_ОУ", color=VECTOR_COLOR, fontsize=10, zorder=9)
-        self.ax_traj.text(nrm_m[0], nrm_m[1], "n_ОУ", color=VECTOR_COLOR, fontsize=10, zorder=9)
-
-        self.ax_traj.arrow(tp[0], tp[1], tt[0]*scale_t, tt[1]*scale_t, color=VECTOR_COLOR,
-                           width=12.0, head_width=120.0, length_includes_head=True, zorder=6)
-        self.ax_traj.arrow(tp[0], tp[1], tn[0]*scale_t*0.6, tn[1]*scale_t*0.6, color=VECTOR_COLOR,
-                           width=8.0, head_width=90.0, length_includes_head=True, zorder=6)
-
-        tau_t = tp + tt * scale_t * 1.08
-        nrm_t = tp + tn * scale_t * 0.72
-        self.ax_traj.text(tau_t[0], tau_t[1], "τ_ОС", color=VECTOR_COLOR, fontsize=10, zorder=9)
-        self.ax_traj.text(nrm_t[0], nrm_t[1], "n_ОС", color=VECTOR_COLOR, fontsize=10, zorder=9)
-
-        ang = math.degrees(math.acos(float(np.clip(np.dot(mt, tt), -1.0, 1.0))))
-        self.pause_info_var.set(
-            f"Пауза\n\nУгол между векторами\nскорости ОУ и ОС:\n{ang:.2f} град"
+        self.ax.text(
+            0.02, 0.98,
+            f"Шаг {step_idx + 1} / {len(self.sampled_missile)}\n"
+            f"t = {self.sampled_times[step_idx]:.2f} с\n"
+            f"ε = {eps:.2f}°\n"
+            f"ϑ = {theta:.2f}°\n"
+            f"jц = ϑ - ε = {jc:.2f}°\n"
+            f"Δ = jц = {delta:.2f}°\n"
+            f"|Vц| = {norm(vt):.2f} м/с\n"
+            f"d = {state.distance:.2f} м",
+            transform=self.ax.transAxes,
+            ha="left", va="top",
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.93)
         )
-
-    def _render(self, show_vectors=False):
-        self.figure.clear()
-        self.ax_traj = self.figure.add_subplot(211)
-        self.ax_dist = self.figure.add_subplot(212)
-        if self.sim is None:
-            self._draw_empty()
-            return
-
-        h = self.sim.history
-        missile = np.array(h.missile_pos)
-        target = np.array(h.target_pos)
-        time = np.array(h.t)
-        distance = np.array(h.distance)
-
-        self.ax_traj.plot(missile[:, 0], missile[:, 1], color=TRAJ_MISSILE_COLOR, linewidth=1.8, label="Траектория ОУ")
-        self.ax_traj.plot(target[:, 0], target[:, 1], color=TRAJ_TARGET_COLOR, linewidth=1.8, label="Траектория ОС")
-
-        if self.sim.finished and h.event.hit:
-            x, z = target[-1]
-            self._draw_explosion(x, z)
-        else:
-            self._draw_icons(missile[-1], target[-1])
-
-        if show_vectors:
-            self._draw_pause_vectors()
-        else:
-            self.pause_info_var.set("")
-
-        self.ax_traj.set_title("Траектории в плоскости OXZ")
-        self.ax_traj.set_xlabel("x, м")
-        self.ax_traj.set_ylabel("z, м")
-        self.ax_traj.grid(True)
-        self.ax_traj.set_aspect("equal", adjustable="box")
-        self.ax_traj.margins(x=0.08, y=0.12)
-        self.ax_traj.legend(loc="best")
-
-        self.ax_dist.plot(time, distance, color="black", linewidth=1.8, label="Дальность")
-        if h.min_distance_time is not None:
-            self.ax_dist.plot([h.min_distance_time], [h.min_distance], marker="o", color="black", linestyle="None", label="d_min")
-        self.ax_dist.set_title("Дальность во времени")
-        self.ax_dist.set_xlabel("t, с")
-        self.ax_dist.set_ylabel("d, м")
-        self.ax_dist.grid(True)
-        self.ax_dist.legend(loc="best")
-
-        self.figure.subplots_adjust(left=0.08, right=0.98, top=0.95, bottom=0.07, hspace=0.38)
         self.canvas.draw()
-        self._update_info(show_vectors)
 
-
-    def _update_info(self, show_vectors):
-        if self.sim is None:
-            self.info_var.set("Готов к расчету")
+    def next_step(self):
+        if self.result is None:
             return
-        h = self.sim.history
-        wind = np.array(self.sim.params["wind"], dtype=float)
-        vg_m = self.sim.missile.vel + wind
-        vg_t = self.sim.target.vel + wind
-        lines = []
-        lines.append("Пауза" if self.paused else ("Расчет завершен" if self.sim.finished else "Анимация"))
-        lines.append(f"t = {self.sim.time:.2f} с")
-        lines.append(f"d = {h.distance[-1]:.2f} м")
-        lines.append(f"d_min = {h.min_distance:.2f} м")
-        lines.append(f"V_ОУ = ({vg_m[0]:.2f}, {vg_m[1]:.2f}) м/с")
-        lines.append(f"V_ОС = ({vg_t[0]:.2f}, {vg_t[1]:.2f}) м/с")
-        lines.append(f"a_n,max = {self.sim.params.get('missile_max_normal_acc', 0.0):.2f} м/с²")
-        lines.append(f"dt = {self.sim.params['dt']:.3f} с")
-        if self.sim.finished:
-            lines.append(f"Событие: {h.event.reason}")
-        self.info_var.set("\n".join(lines))
+        self._draw_step(self.current_step + 1)
+        self._update_nav_buttons()
+
+    def prev_step(self):
+        if self.result is None:
+            return
+        self._draw_step(self.current_step - 1)
+        self._update_nav_buttons()
+
+    def toggle_zoom(self):
+        if self.result is None:
+            return
+        self.zoom_mode = not self.zoom_mode
+        self.btn_zoom.configure(text=("Общий вид" if self.zoom_mode else "Приблизить"))
+        self._draw_step(self.current_step)
+
+    def clear_all(self):
+        self.result = None
+        self.sampled_missile = None
+        self.sampled_target = None
+        self.sampled_times = None
+        self.sampled_state_idx = None
+        self.current_step = 0
+        self.zoom_mode = False
+        self.ax.clear()
+        self.ax.grid(True)
+        self.ax.set_title("Пошаговое графическое построение метода прямого наведения")
+        self.ax.set_xlabel("x, м")
+        self.ax.set_ylabel("z, м")
+        self.canvas.draw()
+        self._update_nav_buttons()
+        self.info.set("Очищено. Введите данные и снова постройте траекторию.")
