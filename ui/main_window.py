@@ -8,9 +8,9 @@ import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.patches as patches
 from matplotlib.figure import Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
-from config import DEFAULT_VALUES, GUIDANCE_METHODS, MODES, SCENARIOS
+from config import DEFAULT_VALUES, GUIDANCE_METHODS, MODES, PN_PRESETS, SCENARIOS
 from core.entities import BodyState
 from core.math2d import vec, from_angle_deg, normalize, perp, norm
 from core.simulator import DirectGuidanceSimulator
@@ -39,11 +39,17 @@ class MainWindow(tk.Frame):
         self.replace_vars = {}
         self.info_var = tk.StringVar(value="Готов к расчету")
         self.pause_info_var = tk.StringVar(value="")
+        self.guidance_info_var = tk.StringVar(value="")
         self.sim = None
         self.paused = False
         self.after_id = None
         self.locked_widgets = []
         self.start_button = None
+        self.traj_window = None
+        self.traj_window_figure = None
+        self.traj_window_canvas = None
+        self.traj_window_ax = None
+        self.traj_drag_state = None
         self.started = False
         self.slider_vars = {}
         self.slider_value_labels = {}
@@ -51,13 +57,18 @@ class MainWindow(tk.Frame):
         self.current_target_motion_mode = "stationary"
         self.sine_params = None
         self.sine_controls_frame = None
+        self.pn_controls_frame = None
         self.sine_amplitude_info_var = tk.StringVar(value="R = -")
         self.sine_frequency_info_var = tk.StringVar(value="f = -")
+        self.pn_hint_var = tk.StringVar(value="")
         self._configure_theme()
         self._build_ui()
         self._apply_values(DEFAULT_VALUES)
         self._apply_scenario_values("Цель стоит")
         self._apply_replace_defaults()
+        self._set_slider_value("navigation_constant", DEFAULT_VALUES["navigation_constant"])
+        self._update_pn_controls_visibility()
+        self._update_pn_hint()
         self._draw_empty()
 
     def _configure_theme(self):
@@ -158,9 +169,11 @@ class MainWindow(tk.Frame):
         self._set_slider_value("target_vz", self.sim.target.vel[1])
         self._set_slider_value("target_ax", self.sim.target.acc[0])
         self._set_slider_value("target_az", self.sim.target.acc[1])
+        self._set_slider_value("navigation_constant", self.sim.params.get("navigation_constant", 3.0))
         self._set_slider_value("wind_x", wind[0])
         self._set_slider_value("wind_z", wind[1])
         self._update_sine_output_labels()
+        self._update_pn_hint()
 
     def _target_speed_for_sine(self) -> float:
         return norm(vec(self._f("target_vx"), self._f("target_vz")))
@@ -252,6 +265,13 @@ class MainWindow(tk.Frame):
         elif key == "target_az":
             self.sim.target.acc[1] = value
             self.sim.params["target_override_acc"] = True
+        elif key == "navigation_constant":
+            self.sim.params["navigation_constant"] = value
+            if "navigation_constant" in self.vars:
+                self.vars["navigation_constant"].set(f"{value:.2f}")
+            if "pn_preset" in self.vars:
+                self.vars["pn_preset"].set("Пользовательское N")
+            self._update_pn_hint()
         elif key == "wind_x":
             self.sim.params["wind"][0] = value
         elif key == "wind_z":
@@ -353,7 +373,8 @@ class MainWindow(tk.Frame):
                 ttk.Label(grid_parent, text="").grid(row=row, column=2, sticky="ew")
             row += 1
 
-        combo("Метод наведения", GUIDANCE_METHODS, "guidance_method", GUIDANCE_METHODS[0])
+        method_cb = combo("Метод наведения", GUIDANCE_METHODS, "guidance_method", GUIDANCE_METHODS[0])
+        method_cb.bind("<<ComboboxSelected>>", self._on_guidance_method_changed)
         combo("Режим", MODES, "mode", MODES[1])
         cb = combo("Сценарий", SCENARIOS, "scenario", SCENARIOS[0])
         cb.bind("<<ComboboxSelected>>", self._on_scenario)
@@ -369,7 +390,37 @@ class MainWindow(tk.Frame):
         entry("missile_speed", "скорость, м/с", "missile_speed_new")
         entry("missile_course_deg", "курс, град")
         entry("missile_max_normal_acc", "a_n max, м/с²")
-        entry("navigation_constant", "N")
+        entry("navigation_constant", "N", "navigation_constant_new")
+
+        self.pn_controls_frame = ttk.LabelFrame(
+            p,
+            text="Параметры пропорционального наведения",
+            padding=6,
+        )
+        self.pn_controls_frame.columnconfigure(1, weight=1)
+        self.pn_controls_frame.columnconfigure(2, weight=1)
+        self.pn_controls_frame.columnconfigure(3, weight=0)
+        self.pn_controls_frame.grid(row=row, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        pn_row_start = row
+        row = 0
+        ttk.Label(self.pn_controls_frame, text="Пресет ПН").grid(row=row, column=0, sticky="w", pady=1)
+        self.vars["pn_preset"] = tk.StringVar(value=PN_PRESETS[2])
+        pn_cb = ttk.Combobox(
+            self.pn_controls_frame,
+            textvariable=self.vars["pn_preset"],
+            values=PN_PRESETS,
+            state="readonly",
+            width=28,
+        )
+        pn_cb.grid(row=row, column=1, columnspan=2, sticky="ew", pady=1)
+        pn_cb.bind("<<ComboboxSelected>>", self._on_pn_preset_changed)
+        row += 1
+        ttk.Label(self.pn_controls_frame, textvariable=self.pn_hint_var, style="Muted.TLabel", wraplength=420, justify="left").grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=(2, 4)
+        )
+        row += 1
+        row = self._add_live_slider(self.pn_controls_frame, row, "navigation_constant", "Коэффициент N", 1.0, 20.0, 0.1)
+        row = pn_row_start + 1
 
         sep("ОС")
         entry("target_x", "x, м")
@@ -435,14 +486,15 @@ class MainWindow(tk.Frame):
         
         btn = ttk.Frame(p)
         btn.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(10, 0))
-        for i in range(5):
+        for i in range(6):
             btn.columnconfigure(i, weight=1)
         self.start_button = ttk.Button(btn, text="Старт", command=self.start)
         self.start_button.grid(row=0, column=0, sticky="ew", padx=2)
         ttk.Button(btn, text="Пауза", command=self.pause).grid(row=0, column=1, sticky="ew", padx=2)
         ttk.Button(btn, text="Продолжить", command=self.resume).grid(row=0, column=2, sticky="ew", padx=2)
         ttk.Button(btn, text="Заменить", command=self.replace_parameters).grid(row=0, column=3, sticky="ew", padx=2)
-        ttk.Button(btn, text="Очистить", command=self.clear_plots).grid(row=0, column=4, sticky="ew", padx=2)
+        ttk.Button(btn, text="Траектория", command=self.open_trajectory_window).grid(row=0, column=4, sticky="ew", padx=2)
+        ttk.Button(btn, text="Очистить", command=self.clear_plots).grid(row=0, column=5, sticky="ew", padx=2)
         row += 1
 
         ttk.Label(p, textvariable=self.info_var, justify="left", wraplength=500).grid(
@@ -451,17 +503,257 @@ class MainWindow(tk.Frame):
 
     def _build_right(self):
         self.right_panel.rowconfigure(0, weight=1)
+        self.right_panel.rowconfigure(1, weight=0)
         self.right_panel.columnconfigure(0, weight=1)
         self.right_panel.columnconfigure(1, weight=0)
+        self.right_panel.columnconfigure(2, weight=0)
         self.figure = Figure(figsize=(10, 8), dpi=100, facecolor=PANEL_BG)
+        self.ax_guidance = None
+        self.ax_traj = None
+        self.ax_dist = None
+        self.traj_default_limits = None
+        self._layout_standard_figure()
+        self.canvas = FigureCanvasTkAgg(self.figure, master=self.right_panel)
+        self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self.canvas.mpl_connect("scroll_event", self._on_plot_scroll)
+        self.canvas.mpl_connect("button_press_event", self._on_plot_click)
+        self.toolbar_frame = tk.Frame(self.right_panel, bg=BG_COLOR)
+        self.toolbar_frame.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        self.toolbar = NavigationToolbar2Tk(self.canvas, self.toolbar_frame, pack_toolbar=False)
+        self.toolbar.update()
+        self.toolbar.pack(side="left", fill="x")
+        ttk.Label(self.right_panel, textvariable=self.pause_info_var, justify="left", wraplength=220).grid(
+            row=0, column=1, sticky="ne", padx=(10, 0), pady=(10, 0)
+        )
+        self.guidance_info_panel = tk.Frame(self.right_panel, bg=BG_COLOR)
+        self.guidance_info_panel.grid(row=0, column=2, sticky="nw", padx=(6, 0), pady=(10, 0))
+        self.guidance_info_panel.grid_remove()
+
+    def _on_plot_scroll(self, event):
+        if self.sim is None or self.ax_traj is None or event.inaxes != self.ax_traj:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+
+        if event.button == "up":
+            scale = 0.85
+        elif event.button == "down":
+            scale = 1.18
+        else:
+            return
+
+        x0, x1 = self.ax_traj.get_xlim()
+        y0, y1 = self.ax_traj.get_ylim()
+        x = float(event.xdata)
+        y = float(event.ydata)
+
+        new_x0 = x - (x - x0) * scale
+        new_x1 = x + (x1 - x) * scale
+        new_y0 = y - (y - y0) * scale
+        new_y1 = y + (y1 - y) * scale
+
+        self.ax_traj.set_xlim(new_x0, new_x1)
+        self.ax_traj.set_ylim(new_y0, new_y1)
+        self.canvas.draw_idle()
+
+    def _on_plot_click(self, event):
+        if self.sim is None or self.ax_traj is None or event.inaxes != self.ax_traj:
+            return
+        if not getattr(event, "dblclick", False):
+            return
+        if self.traj_default_limits is None:
+            return
+
+        (x0, x1), (y0, y1) = self.traj_default_limits
+        self.ax_traj.set_xlim(x0, x1)
+        self.ax_traj.set_ylim(y0, y1)
+        self.canvas.draw_idle()
+
+    def _close_trajectory_window(self):
+        if self.traj_window is not None:
+            try:
+                self.traj_window.destroy()
+            except Exception:
+                pass
+        self.traj_window = None
+        self.traj_window_figure = None
+        self.traj_window_canvas = None
+        self.traj_window_ax = None
+        self.traj_drag_state = None
+
+    def _on_traj_window_scroll(self, event):
+        if self.traj_window_ax is None or event.inaxes != self.traj_window_ax:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+
+        if event.button == "up":
+            scale = 0.85
+        elif event.button == "down":
+            scale = 1.18
+        else:
+            return
+
+        x0, x1 = self.traj_window_ax.get_xlim()
+        y0, y1 = self.traj_window_ax.get_ylim()
+        x = float(event.xdata)
+        y = float(event.ydata)
+        self.traj_window_ax.set_xlim(x - (x - x0) * scale, x + (x1 - x) * scale)
+        self.traj_window_ax.set_ylim(y - (y - y0) * scale, y + (y1 - y) * scale)
+        if self.traj_window_canvas is not None:
+            self.traj_window_canvas.draw_idle()
+
+    def _on_traj_window_press(self, event):
+        if self.traj_window_ax is None or event.inaxes != self.traj_window_ax or event.button != 1:
+            return
+        if event.x is None or event.y is None:
+            return
+        bbox = self.traj_window_ax.bbox
+        self.traj_drag_state = {
+            "x_px": float(event.x),
+            "y_px": float(event.y),
+            "xlim": self.traj_window_ax.get_xlim(),
+            "ylim": self.traj_window_ax.get_ylim(),
+            "bbox_width": max(float(bbox.width), 1.0),
+            "bbox_height": max(float(bbox.height), 1.0),
+        }
+
+    def _on_traj_window_motion(self, event):
+        if self.traj_drag_state is None or self.traj_window_ax is None or event.inaxes != self.traj_window_ax:
+            return
+        if event.x is None or event.y is None:
+            return
+
+        dx_px = float(event.x) - self.traj_drag_state["x_px"]
+        dy_px = float(event.y) - self.traj_drag_state["y_px"]
+        xlim = self.traj_drag_state["xlim"]
+        ylim = self.traj_drag_state["ylim"]
+        x_span = float(xlim[1] - xlim[0])
+        y_span = float(ylim[1] - ylim[0])
+        dx = dx_px * x_span / self.traj_drag_state["bbox_width"]
+        dy = dy_px * y_span / self.traj_drag_state["bbox_height"]
+        self.traj_window_ax.set_xlim(xlim[0] - dx, xlim[1] - dx)
+        self.traj_window_ax.set_ylim(ylim[0] - dy, ylim[1] - dy)
+        if self.traj_window_canvas is not None:
+            self.traj_window_canvas.draw_idle()
+
+    def _on_traj_window_release(self, event):
+        self.traj_drag_state = None
+
+    def _draw_trajectory_axes(self, ax, show_legend: bool = True):
+        if self.sim is None:
+            return
+
+        h = self.sim.history
+        missile = np.array(h.missile_pos)
+        target = np.array(h.target_pos)
+        time = np.array(h.t)
+        self._style_axes(ax)
+        ax.plot(missile[:, 0], missile[:, 1], color=TRAJ_MISSILE_COLOR, linewidth=2.0, label="Траектория ОУ")
+        ax.plot(target[:, 0], target[:, 1], color=TRAJ_TARGET_COLOR, linewidth=2.0, label="Траектория ОС")
+        if self.sim.params.get("guidance_method") == "Пропорциональное наведение":
+            current_ax = self.ax_traj
+            self.ax_traj = ax
+            try:
+                self._draw_traj_snapshots(missile, target, time, np.array(h.missile_ground_vel))
+            finally:
+                self.ax_traj = current_ax
+        if self.sim.finished and h.event.hit:
+            x, z = target[-1]
+            current_ax = self.ax_traj
+            self.ax_traj = ax
+            try:
+                self._draw_explosion(x, z)
+            finally:
+                self.ax_traj = current_ax
+        else:
+            current_ax = self.ax_traj
+            self.ax_traj = ax
+            try:
+                self._draw_icons(missile[-1], target[-1])
+            finally:
+                self.ax_traj = current_ax
+        ax.set_title("Траектории в плоскости OXZ")
+        ax.set_xlabel("x, м")
+        ax.set_ylabel("z, м")
+        ax.set_aspect("equal", adjustable="box")
+        ax.margins(x=0.08, y=0.12)
+        if show_legend:
+            legend = ax.legend(loc="best")
+            legend.get_frame().set_facecolor(PANEL_BG)
+            legend.get_frame().set_edgecolor(GRID_COLOR)
+            for text in legend.get_texts():
+                text.set_color(TEXT_COLOR)
+
+    def open_trajectory_window(self):
+        if self.sim is None:
+            messagebox.showinfo("Траектория", "Сначала выполните расчёт, затем можно открыть траекторию в отдельном окне.")
+            return
+
+        if self.traj_window is not None:
+            try:
+                self.traj_window.lift()
+                self.traj_window.focus_force()
+                return
+            except Exception:
+                self._close_trajectory_window()
+
+        win = tk.Toplevel(self)
+        win.title("Траектория в отдельном окне")
+        win.geometry("1200x760")
+        try:
+            win.state("zoomed")
+        except Exception:
+            try:
+                win.attributes("-zoomed", True)
+            except Exception:
+                pass
+        win.configure(bg=BG_COLOR)
+        win.protocol("WM_DELETE_WINDOW", self._close_trajectory_window)
+
+        fig = Figure(figsize=(10, 6), dpi=100, facecolor=PANEL_BG)
+        ax = fig.add_subplot(111)
+        self._draw_trajectory_axes(ax, show_legend=True)
+
+        canvas = FigureCanvasTkAgg(fig, master=win)
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        canvas.mpl_connect("scroll_event", self._on_traj_window_scroll)
+        canvas.mpl_connect("button_press_event", self._on_traj_window_press)
+        canvas.mpl_connect("motion_notify_event", self._on_traj_window_motion)
+        canvas.mpl_connect("button_release_event", self._on_traj_window_release)
+        toolbar_frame = tk.Frame(win, bg=BG_COLOR)
+        toolbar_frame.pack(fill="x")
+        toolbar = NavigationToolbar2Tk(canvas, toolbar_frame, pack_toolbar=False)
+        toolbar.update()
+        toolbar.pack(side="left", fill="x")
+        canvas.draw()
+
+        self.traj_window = win
+        self.traj_window_figure = fig
+        self.traj_window_canvas = canvas
+        self.traj_window_ax = ax
+        self.traj_drag_state = None
+
+    def _selected_guidance_method(self) -> str:
+        if "guidance_method" not in self.vars:
+            return GUIDANCE_METHODS[0]
+        return self.vars["guidance_method"].get()
+
+    def _is_proportional_mode(self) -> bool:
+        return self._selected_guidance_method() == "Пропорциональное наведение"
+
+    def _layout_standard_figure(self):
+        self.ax_guidance = None
         self.ax_traj = self.figure.add_subplot(211)
         self.ax_dist = self.figure.add_subplot(212)
         self.figure.subplots_adjust(left=0.08, right=0.98, top=0.95, bottom=0.07, hspace=0.38)
-        self.canvas = FigureCanvasTkAgg(self.figure, master=self.right_panel)
-        self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
-        ttk.Label(self.right_panel, textvariable=self.pause_info_var, justify="left", wraplength=220).grid(
-            row=0, column=1, sticky="ne", padx=(10,0), pady=(10,0)
-        )
+
+    def _layout_proportional_figure(self):
+        grid = self.figure.add_gridspec(3, 1, height_ratios=[1.0, 2.0, 0.8], hspace=0.30)
+        self.ax_guidance = self.figure.add_subplot(grid[0])
+        self.ax_traj = self.figure.add_subplot(grid[1])
+        self.ax_dist = self.figure.add_subplot(grid[2])
+        self.figure.subplots_adjust(left=0.07, right=0.98, top=0.96, bottom=0.07)
 
     def _random_realistic_velocity(self):
         speed = random.uniform(120.0, 320.0)
@@ -537,6 +829,8 @@ class MainWindow(tk.Frame):
         self._apply_values(vals)
         self._update_sine_output_labels()
         self._update_sine_controls_visibility()
+        self._update_pn_controls_visibility()
+        self._update_pn_hint()
     def _set_initial_locked(self, locked: bool):
         state = "disabled" if locked else "normal"
         combo_state = "disabled" if locked else "readonly"
@@ -550,6 +844,62 @@ class MainWindow(tk.Frame):
         self._apply_scenario_values(self.vars["scenario"].get())
         self._apply_replace_defaults()
 
+    def _on_guidance_method_changed(self, event=None):
+        self._update_pn_controls_visibility()
+        self._update_pn_hint()
+        if self.sim is None:
+            self._draw_empty()
+            return
+        self._render(self.paused)
+
+    def _pn_preset_value(self, preset_name: str) -> float | None:
+        mapping = {
+            "Погоня (N = 1)": 1.0,
+            "Классическое ПН (N = 3)": 3.0,
+            "Близко к идеальному (N = 4)": 4.0,
+            "Близко к идеальному (N = 6)": 6.0,
+            "Почти параллельное сближение (N = 12)": 12.0,
+            "Почти параллельное сближение (N = 20)": 20.0,
+        }
+        return mapping.get(preset_name)
+
+    def _update_pn_hint(self):
+        try:
+            n_value = self._f("navigation_constant")
+        except Exception:
+            self.pn_hint_var.set("")
+            return
+
+        if not self._is_proportional_mode():
+            self.pn_hint_var.set("Для перехода к параллельному сближению увеличивайте коэффициент N.")
+            return
+
+        if n_value <= 1.2:
+            text = "N≈1: метод вырождается в погоню."
+        elif n_value < 4.0:
+            text = "N≈3: классическое пропорциональное наведение."
+        elif n_value <= 6.5:
+            text = "N=4..6: траектория близка к идеальной по конспекту."
+        elif n_value < 12.0:
+            text = "Большие N уменьшают кривизну и приближают метод к параллельному сближению."
+        else:
+            text = "Очень большие N: режим близок к параллельному сближению."
+        self.pn_hint_var.set(text)
+
+    def _on_pn_preset_changed(self, event=None):
+        preset_name = self.vars["pn_preset"].get()
+        value = self._pn_preset_value(preset_name)
+        if value is None:
+            self._update_pn_hint()
+            return
+
+        self.vars["navigation_constant"].set(f"{value:.2f}")
+        self._set_slider_value("navigation_constant", value)
+        self._update_pn_hint()
+        if self.sim is not None:
+            self.sim.params["navigation_constant"] = value
+            self._render(self.paused)
+
     def _update_sine_controls_visibility(self):
         if self.sine_controls_frame is None:
             return
@@ -557,6 +907,14 @@ class MainWindow(tk.Frame):
             self.sine_controls_frame.grid()
         else:
             self.sine_controls_frame.grid_remove()
+
+    def _update_pn_controls_visibility(self):
+        if self.pn_controls_frame is None:
+            return
+        if self._is_proportional_mode():
+            self.pn_controls_frame.grid()
+        else:
+            self.pn_controls_frame.grid_remove()
 
     def _apply_values(self, values):
         for k, v in values.items():
@@ -567,6 +925,7 @@ class MainWindow(tk.Frame):
     def _apply_replace_defaults(self):
         mapping = {
             "missile_speed_new": "missile_speed",
+            "navigation_constant_new": "navigation_constant",
             "target_vx_new": "target_vx",
             "target_vz_new": "target_vz",
             "target_ax_new": "target_ax",
@@ -694,7 +1053,7 @@ class MainWindow(tk.Frame):
                 "guidance_method": self.vars["guidance_method"].get(),
                 "missile_speed": new_speed,
                 "missile_max_normal_acc": self._f("missile_max_normal_acc"),
-                "navigation_constant": self._f("navigation_constant"),
+                "navigation_constant": self._fr("navigation_constant_new"),
                 "wind": vec(self._fr("wind_x_new"), self._fr("wind_z_new")),
                 "dt": self._f("dt"),
                 "t_max": self._f("t_max"),
@@ -707,16 +1066,22 @@ class MainWindow(tk.Frame):
                     "target_sine_phase": self._f("target_sine_phase"),
                 })
             self.sim.replace_runtime_parameters(new_params)
+            self.vars["navigation_constant"].set(f"{new_params['navigation_constant']:.2f}")
+            self._set_slider_value("navigation_constant", new_params["navigation_constant"])
+            self.vars["pn_preset"].set("Пользовательское N")
+            self._update_pn_hint()
             self.info_var.set("Заменены скорости, ускорения, ветер и параметры синусоидального движения. Курс, dt, t_max, порог и координаты не изменялись.")
             self._render(True)
         except Exception as exc:
             messagebox.showerror("Ошибка замены параметров", str(exc))
     def clear_plots(self):
         self._cancel_after()
+        self._close_trajectory_window()
         self.sim = None
         self.paused = False
         self.started = False
         self.pause_info_var.set("")
+        self.guidance_info_var.set("")
         self._set_initial_locked(False)
         if self.start_button is not None:
             self.start_button.configure(state="normal")
@@ -765,8 +1130,18 @@ class MainWindow(tk.Frame):
     def _draw_empty(self):
         self.figure.clear()
         self.figure.set_facecolor(PANEL_BG)
-        self.ax_traj = self.figure.add_subplot(211)
-        self.ax_dist = self.figure.add_subplot(212)
+        self.guidance_info_var.set("")
+        if self._is_proportional_mode():
+            self._layout_proportional_figure()
+            self._style_axes(self.ax_guidance)
+            self.ax_guidance.set_title("Пропорциональное наведение: вращение векторов относительно центра масс ОУ")
+            self.ax_guidance.set_xlabel("ось x")
+            self.ax_guidance.set_ylabel("ось z")
+            self.ax_guidance.set_xlim(-1000.0, 1000.0)
+            self.ax_guidance.set_ylim(-1000.0, 1000.0)
+            self.ax_guidance.set_aspect("equal", adjustable="box")
+        else:
+            self._layout_standard_figure()
         self._style_axes(self.ax_traj)
         self._style_axes(self.ax_dist)
         self.ax_traj.set_title("Траектории в плоскости OXZ")
@@ -782,7 +1157,8 @@ class MainWindow(tk.Frame):
         self.ax_dist.grid(True)
         self.ax_dist.set_xlim(0.0, 1.0)
         self.ax_dist.set_ylim(0.0, 1.0)
-        self.figure.subplots_adjust(left=0.08, right=0.98, top=0.95, bottom=0.07, hspace=0.38)
+        if not self._is_proportional_mode():
+            self.figure.subplots_adjust(left=0.08, right=0.98, top=0.95, bottom=0.07, hspace=0.38)
         self.canvas.draw()
 
     def _style_axes(self, ax):
@@ -794,6 +1170,13 @@ class MainWindow(tk.Frame):
         ax.yaxis.label.set_color(TEXT_COLOR)
         ax.title.set_color(TEXT_COLOR)
         ax.grid(True, color=GRID_COLOR, alpha=0.65)
+
+    def _style_info_axes(self, ax):
+        ax.set_facecolor(SURFACE_BG)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_color(GRID_COLOR)
 
     def _draw_explosion(self, x, z):
         angles = np.linspace(0.0, 2.0 * np.pi, 12, endpoint=False)
@@ -866,11 +1249,220 @@ class MainWindow(tk.Frame):
             f"Пауза\n\nУгол между векторами\nскорости ОУ и ОС:\n{ang:.2f} град"
         )
 
+    def _vector_arrow(self, ax, origin: np.ndarray, vector: np.ndarray, color: str, label: str, linewidth: float = 2.4, zorder: int = 6):
+        vec_norm = norm(vector)
+        if vec_norm < 1e-9:
+            return
+        ax.annotate(
+            "",
+            xy=(origin[0] + vector[0], origin[1] + vector[1]),
+            xytext=(origin[0], origin[1]),
+            arrowprops=dict(arrowstyle="-|>", color=color, lw=linewidth, shrinkA=0.0, shrinkB=0.0),
+            zorder=zorder,
+        )
+        if label:
+            text_pos = origin + vector * 1.05
+            ax.text(text_pos[0], text_pos[1], label, color=color, fontsize=11, weight="bold", zorder=zorder + 1)
+
+    def _update_proportional_side_info(self, rel_norm: float):
+        if self.sim is None or self.sim.params.get("guidance_method") != "Пропорциональное наведение":
+            self.guidance_info_var.set("")
+            if hasattr(self, "guidance_info_panel"):
+                self.guidance_info_panel.grid_remove()
+            return
+
+        h = self.sim.history
+        los_rate = h.los_rate[-1] if h.los_rate else 0.0
+        missile_turn_rate = h.missile_turn_rate[-1] if h.missile_turn_rate else 0.0
+        proportional_turn_rate = h.proportional_turn_rate[-1] if h.proportional_turn_rate else 0.0
+        ratio_text = "не определяется"
+        if abs(proportional_turn_rate) > 1e-9:
+            ratio_text = f"{missile_turn_rate / proportional_turn_rate:.2f}"
+        self._render_guidance_info_panel(
+            [
+                (
+                    "Верхний монитор",
+                    [
+                        ("Линия визирования", "#FEE75C"),
+                        ("Направление скорости ОУ", VECTOR_COLOR),
+                        ("Нормаль к линии визирования", "#FF9F1C"),
+                        ("Поворот скорости ОУ", "#C084FC"),
+                    ],
+                ),
+                (
+                    "Средний монитор",
+                    [
+                        ("Траектория ОУ", TRAJ_MISSILE_COLOR),
+                        ("Траектория цели", TRAJ_TARGET_COLOR),
+                        ("Линия визирования каждые 6 с", "#FEE75C"),
+                        ("Точка встречи", HIT_COLOR),
+                    ],
+                ),
+            ],
+            [
+                f"Угловая скорость линии визирования: {los_rate:.4f} рад/с",
+                f"Угловая скорость поворота скорости ОУ: {missile_turn_rate:.4f} рад/с",
+                f"Расчетное значение N·ω_ЛВ: {proportional_turn_rate:.4f} рад/с",
+                f"Отношение ω_ОУ / (N·ω_ЛВ): {ratio_text}",
+                f"Дальность до цели: {rel_norm:.1f} м",
+            ],
+        )
+
+    def _render_guidance_info_panel(self, sections, stats_lines):
+        panel = self.guidance_info_panel
+        for child in panel.winfo_children():
+            child.destroy()
+
+        panel.configure(bg=BG_COLOR)
+        row = 0
+        for title, items in sections:
+            ttk.Label(panel, text=title, style="TLabel").grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 2))
+            row += 1
+            for text, color in items:
+                sample = tk.Canvas(panel, width=34, height=12, bg=BG_COLOR, highlightthickness=0)
+                sample.grid(row=row, column=0, sticky="w", padx=(0, 6), pady=1)
+                sample.create_line(2, 6, 32, 6, fill=color, width=3)
+                ttk.Label(panel, text=text, style="Muted.TLabel").grid(row=row, column=1, sticky="w", pady=1)
+                row += 1
+            tk.Frame(panel, height=8, bg=BG_COLOR).grid(row=row, column=0, columnspan=2, sticky="ew")
+            row += 1
+
+        for line in stats_lines:
+            ttk.Label(panel, text=line, style="Muted.TLabel").grid(row=row, column=0, columnspan=2, sticky="w", pady=1)
+            row += 1
+
+        panel.grid()
+
+    def _draw_proportional_guidance_view(self):
+        if self.sim is None or self.ax_guidance is None:
+            return
+
+        ax = self.ax_guidance
+        h = self.sim.history
+        missile_pos = np.array(h.missile_pos)
+        target_pos = np.array(h.target_pos)
+        missile_vel = np.array(h.missile_ground_vel)
+        rel = target_pos - missile_pos
+
+        los_dirs = []
+        vel_dirs = []
+        for rel_vec, vel_vec in zip(rel, missile_vel):
+            if norm(rel_vec) > 1e-9:
+                los_dirs.append(normalize(rel_vec))
+            else:
+                los_dirs.append(np.array([1.0, 0.0], dtype=float))
+            if norm(vel_vec) > 1e-9:
+                vel_dirs.append(normalize(vel_vec))
+            else:
+                vel_dirs.append(np.array([1.0, 0.0], dtype=float))
+
+        los_dirs = np.array(los_dirs)
+        vel_dirs = np.array(vel_dirs)
+        radius = 1.0
+        los_tip = los_dirs * radius
+        vel_tip = vel_dirs * radius * 0.82
+        los_rate = h.los_rate[-1] if h.los_rate else 0.0
+        missile_turn_rate = h.missile_turn_rate[-1] if h.missile_turn_rate else 0.0
+        proportional_turn_rate = h.proportional_turn_rate[-1] if h.proportional_turn_rate else 0.0
+        nav_const = float(self.sim.params.get("navigation_constant", 3.0))
+
+        theta = np.linspace(0.0, 2.0 * np.pi, 256)
+        ax.plot(np.cos(theta), np.sin(theta), linestyle="--", linewidth=1.0, color=GRID_COLOR, alpha=0.7, zorder=1)
+        ax.axhline(0.0, color=GRID_COLOR, linewidth=0.8, alpha=0.7, zorder=1)
+        ax.axvline(0.0, color=GRID_COLOR, linewidth=0.8, alpha=0.7, zorder=1)
+        ax.plot(los_tip[:, 0], los_tip[:, 1], color="#FEE75C", linewidth=1.8, alpha=0.9, zorder=3)
+        ax.plot(vel_tip[:, 0], vel_tip[:, 1], color=VECTOR_COLOR, linewidth=1.8, alpha=0.9, zorder=3)
+
+        ax.plot([0.0], [0.0], marker="o", markersize=7, color=TRAJ_MISSILE_COLOR, zorder=7)
+
+        self._vector_arrow(ax, np.array([0.0, 0.0]), los_tip[-1], "#FEE75C", "", linewidth=2.8, zorder=6)
+        self._vector_arrow(ax, np.array([0.0, 0.0]), vel_tip[-1], VECTOR_COLOR, "", linewidth=2.8, zorder=6)
+
+        current_missile_pos = missile_pos[-1]
+        current_target_pos = target_pos[-1]
+        current_rel = current_target_pos - current_missile_pos
+        rel_norm = max(norm(current_rel), 1e-9)
+        los_normal = perp(current_rel / rel_norm)
+        self._vector_arrow(ax, np.array([0.0, 0.0]), los_normal * 0.58, "#FF9F1C", "", linewidth=2.2, zorder=5)
+
+        turn_sign = 1.0 if missile_turn_rate >= 0.0 else -1.0
+        accel_axis = turn_sign * perp(vel_dirs[-1]) * 0.52
+        self._vector_arrow(ax, np.array([0.0, 0.0]), accel_axis, "#C084FC", "", linewidth=2.2, zorder=5)
+
+        ax.set_xlim(-1.25, 1.25)
+        ax.set_ylim(-1.25, 1.25)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_anchor("W")
+        ax.set_title("")
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+        ax.set_xticklabels([])
+        ax.set_yticklabels([])
+        self._update_proportional_side_info(rel_norm)
+
+    def _draw_traj_snapshots(self, missile: np.ndarray, target: np.ndarray, time: np.ndarray, missile_ground_vel: np.ndarray):
+        if len(time) == 0:
+            return
+
+        snapshot_times = np.arange(0.0, float(time[-1]) + 1e-9, 6.0)
+        if len(snapshot_times) == 0:
+            return
+
+        x0, x1 = self.ax_traj.get_xlim()
+        z0, z1 = self.ax_traj.get_ylim()
+        span = max(abs(x1 - x0), abs(z1 - z0), 1.0)
+        vel_scale = max(1200.0, 0.08 * span)
+
+        used_los_label = False
+        used_vel_label = False
+        for snapshot_time in snapshot_times:
+            idx = int(np.argmin(np.abs(time - snapshot_time)))
+            mp = missile[idx]
+            tp = target[idx]
+            vg = missile_ground_vel[idx]
+            rel = tp - mp
+
+            los_kwargs = {
+                "color": "#FEE75C",
+                "linewidth": 1.1,
+                "alpha": 0.45,
+                "zorder": 4,
+            }
+            vel_kwargs = {
+                "color": VECTOR_COLOR,
+                "linewidth": 1.2,
+                "alpha": 0.55,
+                "zorder": 5,
+            }
+
+            if not used_los_label:
+                los_kwargs["label"] = "Линия визирования каждые 6 с"
+                used_los_label = True
+            if not used_vel_label:
+                vel_kwargs["label"] = "Вектор скорости ОУ каждые 6 с"
+                used_vel_label = True
+
+            self.ax_traj.plot([mp[0], tp[0]], [mp[1], tp[1]], **los_kwargs)
+
+            if norm(vg) > 1e-9:
+                vel_dir = normalize(vg)
+                vel_vec = vel_dir * vel_scale
+                self.ax_traj.annotate(
+                    "",
+                    xy=(mp[0] + vel_vec[0], mp[1] + vel_vec[1]),
+                    xytext=(mp[0], mp[1]),
+                    arrowprops=dict(arrowstyle="-|>", color=VECTOR_COLOR, lw=1.2, alpha=0.55, shrinkA=0.0, shrinkB=0.0),
+                    zorder=5,
+                )
+
     def _render(self, show_vectors=False):
         self.figure.clear()
         self.figure.set_facecolor(PANEL_BG)
-        self.ax_traj = self.figure.add_subplot(211)
-        self.ax_dist = self.figure.add_subplot(212)
+        if self.sim is not None and self.sim.params.get("guidance_method") == "Пропорциональное наведение":
+            self._layout_proportional_figure()
+            self._style_axes(self.ax_guidance)
+        else:
+            self._layout_standard_figure()
         self._style_axes(self.ax_traj)
         self._style_axes(self.ax_dist)
         if self.sim is None:
@@ -886,6 +1478,9 @@ class MainWindow(tk.Frame):
         self.ax_traj.plot(missile[:, 0], missile[:, 1], color=TRAJ_MISSILE_COLOR, linewidth=1.8, label="Траектория ОУ")
         self.ax_traj.plot(target[:, 0], target[:, 1], color=TRAJ_TARGET_COLOR, linewidth=1.8, label="Траектория ОС")
 
+        if self.sim.params.get("guidance_method") == "Пропорциональное наведение":
+            self._draw_traj_snapshots(missile, target, time, np.array(h.missile_ground_vel))
+
         if self.sim.finished and h.event.hit:
             x, z = target[-1]
             self._draw_explosion(x, z)
@@ -897,16 +1492,22 @@ class MainWindow(tk.Frame):
         else:
             self.pause_info_var.set("")
 
+        if self.sim.params.get("guidance_method") == "Пропорциональное наведение":
+            self._draw_proportional_guidance_view()
+
         self.ax_traj.set_title("Траектории в плоскости OXZ")
         self.ax_traj.set_xlabel("x, м")
         self.ax_traj.set_ylabel("z, м")
         self.ax_traj.set_aspect("equal", adjustable="box")
+        self.ax_traj.set_anchor("W")
         self.ax_traj.margins(x=0.08, y=0.12)
-        legend_traj = self.ax_traj.legend(loc="best")
-        legend_traj.get_frame().set_facecolor(PANEL_BG)
-        legend_traj.get_frame().set_edgecolor(GRID_COLOR)
-        for text in legend_traj.get_texts():
-            text.set_color(TEXT_COLOR)
+        self.traj_default_limits = (self.ax_traj.get_xlim(), self.ax_traj.get_ylim())
+        if self.sim.params.get("guidance_method") != "Пропорциональное наведение":
+            legend_traj = self.ax_traj.legend(loc="best")
+            legend_traj.get_frame().set_facecolor(PANEL_BG)
+            legend_traj.get_frame().set_edgecolor(GRID_COLOR)
+            for text in legend_traj.get_texts():
+                text.set_color(TEXT_COLOR)
 
         self.ax_dist.plot(time, distance, color=TEXT_COLOR, linewidth=1.8, label="Дальность")
         if h.min_distance_time is not None:
@@ -920,7 +1521,8 @@ class MainWindow(tk.Frame):
         for text in legend_dist.get_texts():
             text.set_color(TEXT_COLOR)
 
-        self.figure.subplots_adjust(left=0.08, right=0.98, top=0.95, bottom=0.07, hspace=0.38)
+        if self.sim.params.get("guidance_method") != "Пропорциональное наведение":
+            self.figure.subplots_adjust(left=0.08, right=0.98, top=0.95, bottom=0.07, hspace=0.38)
         self.canvas.draw()
         self._update_info(show_vectors)
 
@@ -944,6 +1546,15 @@ class MainWindow(tk.Frame):
         lines.append(f"a_n,max = {self.sim.params.get('missile_max_normal_acc', 0.0):.2f} м/с²")
         if self.sim.params.get("guidance_method") == "Пропорциональное наведение":
             lines.append(f"N = {self.sim.params.get('navigation_constant', 3.0):.2f}")
+            n_value = float(self.sim.params.get("navigation_constant", 3.0))
+            if n_value <= 1.2:
+                lines.append("Режим ПН близок к погоне")
+            elif n_value >= 12.0:
+                lines.append("Режим ПН близок к параллельному сближению")
+            if h.los_rate:
+                lines.append(f"ω_ЛВ = {h.los_rate[-1]:.4f} рад/с")
+            if h.missile_turn_rate:
+                lines.append(f"ω_ОУ = {h.missile_turn_rate[-1]:.4f} рад/с")
         if self.sim.params.get("target_motion_mode") == "sinusoidal":
             lines.append(f"R = {self.sim.params.get('target_sine_amplitude', 0.0):.1f} м")
             lines.append(f"f = {self.sim.params.get('target_sine_frequency', 0.0):.4f} 1/м")
