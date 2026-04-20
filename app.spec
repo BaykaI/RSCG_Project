@@ -1,11 +1,19 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from pathlib import Path
+import sys
+
+python_root = Path(sys.base_prefix)
+tcl_root = python_root / "tcl"
 
 a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[
+        (str(tcl_root / "tcl8.6"), "lib/tcl8.6"),
+        (str(tcl_root / "tk8.6"), "lib/tk8.6"),
+    ],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

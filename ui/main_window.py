@@ -1,4 +1,5 @@
 ﻿from __future__ import annotations
+from dataclasses import dataclass
 import tkinter as tk
 from tkinter import ttk, messagebox
 import numpy as np
@@ -31,6 +32,16 @@ TRAJ_MISSILE_COLOR = "#4EA8FF"
 TRAJ_TARGET_COLOR = "#ED4245"
 VECTOR_COLOR = "#57F287"
 HIT_COLOR = "#A3E635"
+SAVED_TRAJECTORY_COLORS = ["#4EA8FF", "#57F287", "#FEE75C", "#FF9F1C", "#C084FC"]
+
+
+@dataclass
+class SavedTrajectory:
+    label: str
+    missile: np.ndarray
+    target: np.ndarray
+    event_reason: str
+    hit: bool
 
 class MainWindow(tk.Frame):
     def __init__(self, master):
@@ -50,6 +61,14 @@ class MainWindow(tk.Frame):
         self.traj_window_canvas = None
         self.traj_window_ax = None
         self.traj_drag_state = None
+        self.saved_trajectories = []
+        self.saved_traj_window = None
+        self.saved_traj_window_figure = None
+        self.saved_traj_window_canvas = None
+        self.saved_traj_window_ax = None
+        self.saved_traj_drag_state = None
+        self.saved_menu_window = None
+        self.saved_menu_listbox = None
         self.started = False
         self.slider_vars = {}
         self.slider_value_labels = {}
@@ -486,7 +505,7 @@ class MainWindow(tk.Frame):
         
         btn = ttk.Frame(p)
         btn.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(10, 0))
-        for i in range(6):
+        for i in range(8):
             btn.columnconfigure(i, weight=1)
         self.start_button = ttk.Button(btn, text="Старт", command=self.start)
         self.start_button.grid(row=0, column=0, sticky="ew", padx=2)
@@ -494,7 +513,9 @@ class MainWindow(tk.Frame):
         ttk.Button(btn, text="Продолжить", command=self.resume).grid(row=0, column=2, sticky="ew", padx=2)
         ttk.Button(btn, text="Заменить", command=self.replace_parameters).grid(row=0, column=3, sticky="ew", padx=2)
         ttk.Button(btn, text="Траектория", command=self.open_trajectory_window).grid(row=0, column=4, sticky="ew", padx=2)
-        ttk.Button(btn, text="Очистить", command=self.clear_plots).grid(row=0, column=5, sticky="ew", padx=2)
+        ttk.Button(btn, text="Запомнить", command=self.save_current_trajectory).grid(row=0, column=5, sticky="ew", padx=2)
+        ttk.Button(btn, text="Сохранённые", command=self.open_saved_trajectories_menu).grid(row=0, column=6, sticky="ew", padx=2)
+        ttk.Button(btn, text="Очистить", command=self.clear_plots).grid(row=0, column=7, sticky="ew", padx=2)
         row += 1
 
         ttk.Label(p, textvariable=self.info_var, justify="left", wraplength=500).grid(
@@ -739,8 +760,311 @@ class MainWindow(tk.Frame):
             return GUIDANCE_METHODS[0]
         return self.vars["guidance_method"].get()
 
+    def _saved_trajectory_label(self) -> str:
+        if self.sim is None:
+            return "Траектория"
+        method = self.sim.params.get("guidance_method", "Прямой метод")
+        short_method = "ПН" if method == "Пропорциональное наведение" else "ПМ"
+        run_number = len(self.saved_trajectories) + 1
+        state = "попадание" if self.sim.history.event.hit else "без попадания"
+        return f"{run_number}. {short_method}, t={self.sim.time:.1f} c, {state}"
+
     def _is_proportional_mode(self) -> bool:
         return self._selected_guidance_method() == "Пропорциональное наведение"
+
+    def _build_saved_trajectory(self) -> SavedTrajectory | None:
+        if self.sim is None:
+            return None
+        history = self.sim.history
+        if not history.missile_pos or not history.target_pos:
+            return None
+        return SavedTrajectory(
+            label=self._saved_trajectory_label(),
+            missile=np.array(history.missile_pos, dtype=float),
+            target=np.array(history.target_pos, dtype=float),
+            event_reason=history.event.reason,
+            hit=history.event.hit,
+        )
+
+    def _close_saved_trajectories_window(self):
+        if self.saved_traj_window is not None:
+            try:
+                self.saved_traj_window.destroy()
+            except Exception:
+                pass
+        self.saved_traj_window = None
+        self.saved_traj_window_figure = None
+        self.saved_traj_window_canvas = None
+        self.saved_traj_window_ax = None
+        self.saved_traj_drag_state = None
+
+    def _on_saved_traj_window_scroll(self, event):
+        if self.saved_traj_window_ax is None or event.inaxes != self.saved_traj_window_ax:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+
+        if event.button == "up":
+            scale = 0.85
+        elif event.button == "down":
+            scale = 1.18
+        else:
+            return
+
+        x0, x1 = self.saved_traj_window_ax.get_xlim()
+        y0, y1 = self.saved_traj_window_ax.get_ylim()
+        x = float(event.xdata)
+        y = float(event.ydata)
+        self.saved_traj_window_ax.set_xlim(x - (x - x0) * scale, x + (x1 - x) * scale)
+        self.saved_traj_window_ax.set_ylim(y - (y - y0) * scale, y + (y1 - y) * scale)
+        if self.saved_traj_window_canvas is not None:
+            self.saved_traj_window_canvas.draw_idle()
+
+    def _on_saved_traj_window_press(self, event):
+        if self.saved_traj_window_ax is None or event.inaxes != self.saved_traj_window_ax or event.button != 1:
+            return
+        if event.x is None or event.y is None:
+            return
+        bbox = self.saved_traj_window_ax.bbox
+        self.saved_traj_drag_state = {
+            "x_px": float(event.x),
+            "y_px": float(event.y),
+            "xlim": self.saved_traj_window_ax.get_xlim(),
+            "ylim": self.saved_traj_window_ax.get_ylim(),
+            "bbox_width": max(float(bbox.width), 1.0),
+            "bbox_height": max(float(bbox.height), 1.0),
+        }
+
+    def _on_saved_traj_window_motion(self, event):
+        if self.saved_traj_drag_state is None or self.saved_traj_window_ax is None or event.inaxes != self.saved_traj_window_ax:
+            return
+        if event.x is None or event.y is None:
+            return
+
+        dx_px = float(event.x) - self.saved_traj_drag_state["x_px"]
+        dy_px = float(event.y) - self.saved_traj_drag_state["y_px"]
+        xlim = self.saved_traj_drag_state["xlim"]
+        ylim = self.saved_traj_drag_state["ylim"]
+        x_span = float(xlim[1] - xlim[0])
+        y_span = float(ylim[1] - ylim[0])
+        dx = dx_px * x_span / self.saved_traj_drag_state["bbox_width"]
+        dy = dy_px * y_span / self.saved_traj_drag_state["bbox_height"]
+        self.saved_traj_window_ax.set_xlim(xlim[0] - dx, xlim[1] - dx)
+        self.saved_traj_window_ax.set_ylim(ylim[0] - dy, ylim[1] - dy)
+        if self.saved_traj_window_canvas is not None:
+            self.saved_traj_window_canvas.draw_idle()
+
+    def _on_saved_traj_window_release(self, event):
+        self.saved_traj_drag_state = None
+
+    def _close_saved_menu_window(self):
+        if self.saved_menu_window is not None:
+            try:
+                self.saved_menu_window.destroy()
+            except Exception:
+                pass
+        self.saved_menu_window = None
+        self.saved_menu_listbox = None
+
+    def _refresh_saved_menu(self):
+        if self.saved_menu_listbox is None:
+            return
+        self.saved_menu_listbox.delete(0, tk.END)
+        for index, saved in enumerate(self.saved_trajectories, start=1):
+            suffix = "попадание" if saved.hit else saved.event_reason
+            self.saved_menu_listbox.insert(tk.END, f"{index}. {saved.label} | {suffix}")
+
+    def _selected_saved_trajectory_index(self) -> int | None:
+        if self.saved_menu_listbox is None:
+            return None
+        selection = self.saved_menu_listbox.curselection()
+        if not selection:
+            messagebox.showinfo("Сохранённые траектории", "Сначала выберите траекторию в списке.")
+            return None
+        return int(selection[0])
+
+    def delete_selected_saved_trajectory(self):
+        index = self._selected_saved_trajectory_index()
+        if index is None:
+            return
+        removed = self.saved_trajectories.pop(index)
+        self.info_var.set(f"Удалена сохранённая траектория: {removed.label}.")
+        self._refresh_saved_menu()
+        if self.saved_traj_window is not None:
+            if self.saved_trajectories:
+                self._refresh_saved_trajectories_window()
+            else:
+                self._close_saved_trajectories_window()
+
+    def clear_saved_trajectories(self):
+        if not self.saved_trajectories:
+            messagebox.showinfo("Сохранённые траектории", "Список сохранённых траекторий уже пуст.")
+            return
+        self.saved_trajectories.clear()
+        self.info_var.set("Сохранённые траектории удалены.")
+        self._refresh_saved_menu()
+        self._close_saved_trajectories_window()
+
+    def open_saved_trajectories_menu(self):
+        if self.saved_menu_window is not None:
+            try:
+                self.saved_menu_window.lift()
+                self.saved_menu_window.focus_force()
+                self._refresh_saved_menu()
+                return
+            except Exception:
+                self._close_saved_menu_window()
+
+        win = tk.Toplevel(self)
+        win.title("Сохранённые траектории")
+        win.geometry("720x340")
+        win.configure(bg=BG_COLOR)
+        win.protocol("WM_DELETE_WINDOW", self._close_saved_menu_window)
+
+        container = ttk.Frame(win, padding=10, style="TFrame")
+        container.pack(fill="both", expand=True)
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(1, weight=1)
+
+        ttk.Label(
+            container,
+            text="Здесь можно удалить отдельные сохранённые траектории или открыть их общий график.",
+            style="Muted.TLabel",
+            wraplength=660,
+            justify="left",
+        ).grid(row=0, column=0, sticky="ew", pady=(0, 8))
+
+        listbox = tk.Listbox(
+            container,
+            bg=ENTRY_BG,
+            fg=ENTRY_FG,
+            selectbackground=ACCENT_COLOR,
+            selectforeground=TEXT_COLOR,
+            activestyle="none",
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=GRID_COLOR,
+            highlightcolor=ACCENT_COLOR,
+        )
+        listbox.grid(row=1, column=0, sticky="nsew")
+
+        btn_frame = ttk.Frame(container, style="TFrame")
+        btn_frame.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        for i in range(4):
+            btn_frame.columnconfigure(i, weight=1)
+        ttk.Button(btn_frame, text="Показать вместе", command=self.open_saved_trajectories_window).grid(row=0, column=0, sticky="ew", padx=2)
+        ttk.Button(btn_frame, text="Удалить выбранную", command=self.delete_selected_saved_trajectory).grid(row=0, column=1, sticky="ew", padx=2)
+        ttk.Button(btn_frame, text="Очистить список", command=self.clear_saved_trajectories).grid(row=0, column=2, sticky="ew", padx=2)
+        ttk.Button(btn_frame, text="Закрыть", command=self._close_saved_menu_window).grid(row=0, column=3, sticky="ew", padx=2)
+
+        self.saved_menu_window = win
+        self.saved_menu_listbox = listbox
+        self._refresh_saved_menu()
+
+    def _draw_saved_trajectories_axes(self, ax):
+        self._style_axes(ax)
+        ax.set_title("Сохраненные траектории")
+        ax.set_xlabel("x, м")
+        ax.set_ylabel("z, м")
+        ax.set_aspect("equal", adjustable="box")
+
+        for index, saved in enumerate(self.saved_trajectories):
+            color = SAVED_TRAJECTORY_COLORS[index % len(SAVED_TRAJECTORY_COLORS)]
+            ax.plot(
+                saved.missile[:, 0],
+                saved.missile[:, 1],
+                color=color,
+                linewidth=2.0,
+                label=saved.label,
+            )
+            ax.plot(
+                saved.target[:, 0],
+                saved.target[:, 1],
+                color=color,
+                linewidth=1.4,
+                linestyle="--",
+                alpha=0.8,
+                label="_nolegend_",
+            )
+
+        ax.margins(x=0.08, y=0.12)
+        legend = ax.legend(loc="best")
+        legend.get_frame().set_facecolor(PANEL_BG)
+        legend.get_frame().set_edgecolor(GRID_COLOR)
+        for text in legend.get_texts():
+            text.set_color(TEXT_COLOR)
+
+    def _refresh_saved_trajectories_window(self):
+        if self.saved_traj_window_ax is None or self.saved_traj_window_canvas is None:
+            return
+        self.saved_traj_window_ax.clear()
+        self._draw_saved_trajectories_axes(self.saved_traj_window_ax)
+        self.saved_traj_window_canvas.draw_idle()
+
+    def save_current_trajectory(self):
+        if self.sim is None:
+            messagebox.showinfo("Сохранение траектории", "Сначала выполните расчёт, затем можно сохранить траекторию.")
+            return
+
+        saved = self._build_saved_trajectory()
+        if saved is None:
+            messagebox.showerror("Сохранение траектории", "Не удалось сохранить текущую траекторию.")
+            return
+
+        if len(self.saved_trajectories) >= 5:
+            self.saved_trajectories.pop(0)
+
+        self.saved_trajectories.append(saved)
+        self.info_var.set(
+            f"Сохранено траекторий: {len(self.saved_trajectories)} из 5. Последняя: {saved.label}."
+        )
+        self._refresh_saved_menu()
+        if self.saved_traj_window is not None:
+            self._refresh_saved_trajectories_window()
+
+    def open_saved_trajectories_window(self):
+        if not self.saved_trajectories:
+            messagebox.showinfo("Сравнение траекторий", "Пока нет сохранённых траекторий. Нажмите «Запомнить» после расчёта.")
+            return
+
+        if self.saved_traj_window is not None:
+            try:
+                self.saved_traj_window.lift()
+                self.saved_traj_window.focus_force()
+                self._refresh_saved_trajectories_window()
+                return
+            except Exception:
+                self._close_saved_trajectories_window()
+
+        win = tk.Toplevel(self)
+        win.title("Сравнение сохраненных траекторий")
+        win.geometry("1200x760")
+        win.configure(bg=BG_COLOR)
+        win.protocol("WM_DELETE_WINDOW", self._close_saved_trajectories_window)
+
+        fig = Figure(figsize=(10, 6), dpi=100, facecolor=PANEL_BG)
+        ax = fig.add_subplot(111)
+        self.saved_traj_window_ax = ax
+        self._draw_saved_trajectories_axes(ax)
+
+        canvas = FigureCanvasTkAgg(fig, master=win)
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        canvas.mpl_connect("scroll_event", self._on_saved_traj_window_scroll)
+        canvas.mpl_connect("button_press_event", self._on_saved_traj_window_press)
+        canvas.mpl_connect("motion_notify_event", self._on_saved_traj_window_motion)
+        canvas.mpl_connect("button_release_event", self._on_saved_traj_window_release)
+        toolbar_frame = tk.Frame(win, bg=BG_COLOR)
+        toolbar_frame.pack(fill="x")
+        toolbar = NavigationToolbar2Tk(canvas, toolbar_frame, pack_toolbar=False)
+        toolbar.update()
+        toolbar.pack(side="left", fill="x")
+        canvas.draw()
+
+        self.saved_traj_window = win
+        self.saved_traj_window_figure = fig
+        self.saved_traj_window_canvas = canvas
+        self.saved_traj_window_ax = ax
+        self.saved_traj_drag_state = None
 
     def _layout_standard_figure(self):
         self.ax_guidance = None
@@ -1088,7 +1412,9 @@ class MainWindow(tk.Frame):
         self._draw_empty()
         for key in list(self.slider_vars.keys()):
             self._set_slider_value(key, 0.0)
-        self.info_var.set("Очищено")
+        self.info_var.set(
+            f"Очищен текущий расчёт. Сохранённые траектории оставлены: {len(self.saved_trajectories)}."
+        )
 
     def _animate_tick(self):
         if self.sim is None or self.paused:
