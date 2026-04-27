@@ -1,7 +1,7 @@
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import numpy as np
-from .math2d import normalize, norm, resample_polyline
+from .math2d import normalize, norm, signed_angle_deg
 
 @dataclass
 class State:
@@ -12,99 +12,218 @@ class State:
     target_ground_vel: np.ndarray
     distance: float
     time: float
-    theta_deg: float
-    eps_deg: float
-    jc_deg: float
+    params: dict = field(default_factory=dict)
 
 @dataclass
 class Result:
-    states: list
+    states: list[State]
     hit: bool
     hit_index: int
     hit_time: float
+    stopped_by_divergence: bool = False
+    stop_reason: str = ""
+    method: str = "Прямой метод"
 
-def _signed_angle(a: np.ndarray, b: np.ndarray) -> float:
-    a = normalize(a)
-    b = normalize(b)
-    dot = float(np.clip(np.dot(a, b), -1.0, 1.0))
-    ang = float(np.arccos(dot))
-    cross = a[0] * b[1] - a[1] * b[0]
-    return ang if cross >= 0.0 else -ang
+def _rotate(v: np.ndarray, angle_rad: float) -> np.ndarray:
+    c = float(np.cos(angle_rad))
+    s = float(np.sin(angle_rad))
+    return np.array([c * v[0] - s * v[1], s * v[0] + c * v[1]], dtype=float)
 
-def simulate_direct(missile_pos, missile_speed, missile_course_dir, target_pos, target_speed, target_course_dir,
-                    wind, dt, hit_threshold, t_max, max_normal_acc):
-    states = []
+def _limit_turn(prev_dir: np.ndarray, desired_dir: np.ndarray, speed: float, dt: float, max_normal_acc: float) -> np.ndarray:
+    prev_dir = normalize(prev_dir)
+    desired_dir = normalize(desired_dir)
+    if speed <= 1e-9 or max_normal_acc <= 0.0:
+        return desired_dir
+    ang_deg = signed_angle_deg(prev_dir, desired_dir)
+    ang = np.deg2rad(ang_deg)
+    omega_max = max_normal_acc / speed
+    max_turn = omega_max * dt
+    if abs(ang) <= max_turn:
+        return desired_dir
+    return normalize(_rotate(prev_dir, np.sign(ang) * max_turn))
+
+def _append_state(states: list[State], mp: np.ndarray, missile_air: np.ndarray, missile_ground: np.ndarray,
+                  tp: np.ndarray, target_ground: np.ndarray, d: float, t: float, params: dict) -> None:
+    states.append(
+        State(
+            missile_pos=mp.copy(),
+            missile_air_vel=missile_air.copy(),
+            missile_ground_vel=missile_ground.copy(),
+            target_pos=tp.copy(),
+            target_ground_vel=target_ground.copy(),
+            distance=float(d),
+            time=float(t),
+            params=params,
+        )
+    )
+
+def simulate_direct_discrete(
+    missile_pos: np.ndarray,
+    missile_speed: float,
+    missile_course_dir: np.ndarray,
+    target_pos: np.ndarray,
+    target_speed: float,
+    target_course_dir: np.ndarray,
+    wind: np.ndarray,
+    dt: float,
+    t_max: float,
+    hit_threshold: float,
+    max_normal_acc: float,
+) -> Result:
+    states: list[State] = []
     t = 0.0
     mp = missile_pos.copy()
     tp = target_pos.copy()
-
-    mdir = normalize(missile_course_dir)
+    mdir_prev = normalize(missile_course_dir)
     tdir = normalize(target_course_dir)
 
-    tv_air = tdir * target_speed
     hit = False
     hit_idx = -1
     hit_time = t_max
+    stopped_by_divergence = False
+    stop_reason = "Достигнуто t_max"
 
-    while t <= t_max:
+    steps = int(np.floor(t_max / dt)) + 1
+    prev_d: float | None = None
+    was_closing = False
+
+    for _ in range(steps):
         los = tp - mp
         d = norm(los)
         los_dir = normalize(los)
 
-        # Ограничение скорости поворота по максимальной перегрузке:
-        # a_n = V * omega -> omega_max = a_n_max / V
-        if missile_speed > 1e-9 and max_normal_acc > 0.0:
-            ang_to_los = _signed_angle(mdir, los_dir)
-            omega_max = max_normal_acc / missile_speed
-            max_turn = omega_max * dt
-            if abs(ang_to_los) <= max_turn:
-                mdir = los_dir
-            else:
-                turn = np.sign(ang_to_los) * max_turn
-                c = float(np.cos(turn))
-                s = float(np.sin(turn))
-                rot = np.array([[c, -s], [s, c]], dtype=float)
-                mdir = normalize(rot @ mdir)
-        else:
-            mdir = los_dir
+        desired_dir = los_dir
+        mdir = _limit_turn(mdir_prev, desired_dir, missile_speed, dt, max_normal_acc)
 
         missile_air = mdir * missile_speed
+        target_air = tdir * target_speed
         missile_ground = missile_air + wind
-        target_ground = tv_air + wind
+        target_ground = target_air + wind
 
-        horiz = np.array([1.0, 0.0], dtype=float)
-        eps_deg = np.degrees(_signed_angle(horiz, los_dir))
-        theta_deg = np.degrees(_signed_angle(horiz, mdir))
-        jc_deg = theta_deg - eps_deg
+        eps = signed_angle_deg(np.array([1.0, 0.0]), los_dir)
+        theta = signed_angle_deg(np.array([1.0, 0.0]), mdir)
+        jc = theta - eps
+        q = signed_angle_deg(los_dir, mdir)
+        q_c = signed_angle_deg(los_dir, normalize(target_ground))
 
-        states.append(State(
-            mp.copy(), missile_air.copy(), missile_ground.copy(),
-            tp.copy(), target_ground.copy(), d, t,
-            theta_deg, eps_deg, jc_deg
-        ))
+        _append_state(
+            states, mp, missile_air, missile_ground, tp, target_ground, d, t,
+            dict(eps_deg=eps, theta_deg=theta, jc_deg=jc, q_deg=q, q_c_deg=q_c, delta=jc)
+        )
 
         if d <= hit_threshold:
             hit = True
             hit_idx = len(states) - 1
             hit_time = t
+            stop_reason = "Условный контакт"
             break
 
-        mp = mp + missile_ground * dt
+        if prev_d is not None:
+            if d < prev_d - 1e-9:
+                was_closing = True
+            elif was_closing and d > prev_d + 1e-9:
+                stopped_by_divergence = True
+                stop_reason = "ОУ начал удаляться от ОС"
+                break
+
         tp = tp + target_ground * dt
+        mp = mp + missile_ground * dt
+        mdir_prev = mdir.copy()
+        prev_d = d
         t += dt
 
-    if not states:
-        states.append(State(
-            missile_pos.copy(), np.zeros(2), np.zeros(2),
-            target_pos.copy(), tv_air.copy() + wind, norm(target_pos - missile_pos), 0.0,
-            0.0, 0.0, 0.0
-        ))
-    return Result(states, hit, hit_idx, hit_time)
+    return Result(states, hit, hit_idx, hit_time, stopped_by_divergence, stop_reason, "Прямой метод")
 
-def make_equal_parts(result: Result, parts: int):
-    missile_points = np.array([s.missile_pos for s in result.states], dtype=float)
-    sampled_missile, idx = resample_polyline(missile_points, parts + 1)
-    sampled_target = np.array([result.states[min(i, len(result.states)-1)].target_pos for i in idx], dtype=float)
-    sampled_times = np.array([result.states[min(i, len(result.states)-1)].time for i in idx], dtype=float)
-    sampled_state_idx = np.array([min(i, len(result.states)-1) for i in idx], dtype=int)
-    return sampled_missile, sampled_target, sampled_times, sampled_state_idx
+def simulate_parallel_discrete(
+    missile_pos: np.ndarray,
+    missile_speed: float,
+    missile_course_dir: np.ndarray,
+    target_pos: np.ndarray,
+    target_speed: float,
+    target_course_dir: np.ndarray,
+    wind: np.ndarray,
+    dt: float,
+    t_max: float,
+    hit_threshold: float,
+    max_normal_acc: float,
+) -> Result:
+    states: list[State] = []
+    t = 0.0
+    mp = missile_pos.copy()
+    tp = target_pos.copy()
+    tdir = normalize(target_course_dir)
+    mdir_prev = normalize(missile_course_dir)
+
+    eps0 = signed_angle_deg(np.array([1.0, 0.0]), normalize(tp - mp))
+
+    hit = False
+    hit_idx = -1
+    hit_time = t_max
+    stopped_by_divergence = False
+    stop_reason = "Достигнуто t_max"
+
+    steps = int(np.floor(t_max / dt)) + 1
+    prev_d: float | None = None
+    was_closing = False
+
+    for _ in range(steps):
+        los = tp - mp
+        d = norm(los)
+        los_dir = normalize(los)
+
+        target_air = tdir * target_speed
+        target_ground = target_air + wind
+        vt_dir = normalize(target_ground)
+
+        eps = signed_angle_deg(np.array([1.0, 0.0]), los_dir)
+        q_c = signed_angle_deg(los_dir, vt_dir)
+        ratio = 0.0 if missile_speed <= 1e-9 else np.clip(
+            norm(target_ground) / missile_speed * np.sin(np.deg2rad(q_c)),
+            -1.0,
+            1.0,
+        )
+        q_p = np.rad2deg(np.arcsin(ratio))
+        theta = eps0 + q_p
+
+        desired_dir = normalize(np.array([np.cos(np.deg2rad(theta)), np.sin(np.deg2rad(theta))], dtype=float))
+        mdir = _limit_turn(mdir_prev, desired_dir, missile_speed, dt, max_normal_acc)
+
+        missile_air = mdir * missile_speed
+        missile_ground = missile_air + wind
+
+        delta = q_p - np.rad2deg(np.arcsin(ratio))
+
+        _append_state(
+            states, mp, missile_air, missile_ground, tp, target_ground, d, t,
+            dict(eps_deg=eps, eps0_deg=eps0, q_p_deg=q_p, q_c_deg=q_c, delta=delta, theta_deg=theta)
+        )
+
+        if d <= hit_threshold:
+            hit = True
+            hit_idx = len(states) - 1
+            hit_time = t
+            stop_reason = "Условный контакт"
+            break
+
+        if prev_d is not None:
+            if d < prev_d - 1e-9:
+                was_closing = True
+            elif was_closing and d > prev_d + 1e-9:
+                stopped_by_divergence = True
+                stop_reason = "ОУ начал удаляться от ОС"
+                break
+
+        tp = tp + target_ground * dt
+        mp = mp + missile_ground * dt
+        mdir_prev = mdir.copy()
+        prev_d = d
+        t += dt
+
+    return Result(states, hit, hit_idx, hit_time, stopped_by_divergence, stop_reason, "Параллельное сближение")
+
+def make_step_arrays(result: Result):
+    idx = np.arange(len(result.states), dtype=int)
+    sampled_missile = np.array([result.states[i].missile_pos for i in idx], dtype=float)
+    sampled_target = np.array([result.states[i].target_pos for i in idx], dtype=float)
+    sampled_times = np.array([result.states[i].time for i in idx], dtype=float)
+    return sampled_missile, sampled_target, sampled_times, idx

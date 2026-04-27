@@ -1,11 +1,11 @@
 import tkinter as tk
 from ui.main_window import MainWindow
 
-def main():
+def main() -> None:
     root = tk.Tk()
-    root.title("Прямое наведение — пошаговое графическое построение")
-    root.geometry("1550x920")
-    root.minsize(1320, 800)
+    root.title("Методы наведения — дискретное графическое построение")
+    root.geometry("1650x950")
+    root.minsize(1400, 860)
     MainWindow(root).pack(fill="both", expand=True)
     root.mainloop()
 
