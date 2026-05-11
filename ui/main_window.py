@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import tkinter as tk
+import time
 from tkinter import ttk, messagebox
 import numpy as np
 import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
+from matplotlib.collections import LineCollection
 from matplotlib.patches import Arc, RegularPolygon
 
 from core.math2d import vec, normalize, norm, from_deg, signed_angle_deg
@@ -32,6 +34,7 @@ STYLE_MAP = {
     "штрихпунктирная": "-.",
     "пунктирная": ":",
 }
+MAX_STEP_LABELS = 60
 
 class MainWindow(tk.Frame):
     def __init__(self, master):
@@ -42,7 +45,10 @@ class MainWindow(tk.Frame):
         self.sampled_target = None
         self.sampled_times = None
         self.sampled_state_idx = None
+        self.efficiency = None
         self.current_step = 0
+        self._pan_start = None
+        self._last_pan_draw = 0.0
         self.history = []
         self._build_ui()
 
@@ -212,6 +218,15 @@ class MainWindow(tk.Frame):
 
         self.step_info = tk.StringVar(value="Нет данных")
         ttk.Label(left, textvariable=self.step_info, justify="left", wraplength=400, relief="solid", padding=8).grid(row=row, column=0, columnspan=2, sticky="ew")
+        row += 1
+
+        ttk.Separator(left, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=8)
+        row += 1
+        ttk.Label(left, text="Оценка эффективности").grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+
+        self.efficiency_info = tk.StringVar(value="Нет данных")
+        ttk.Label(left, textvariable=self.efficiency_info, justify="left", wraplength=400, relief="solid", padding=8).grid(row=row, column=0, columnspan=2, sticky="ew")
 
         self.fig = Figure(figsize=(10, 8), dpi=100)
         self.fig.subplots_adjust(left=0.045, right=0.988, bottom=0.075, top=0.945)
@@ -222,6 +237,10 @@ class MainWindow(tk.Frame):
         self.ax.grid(True, alpha=0.45)
         self.canvas = FigureCanvasTkAgg(self.fig, master=right)
         self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self.canvas.mpl_connect("scroll_event", self._on_plot_scroll)
+        self.canvas.mpl_connect("button_press_event", self._on_plot_button_press)
+        self.canvas.mpl_connect("button_release_event", self._on_plot_button_release)
+        self.canvas.mpl_connect("motion_notify_event", self._on_plot_motion)
         self._sync_method_controls()
 
     def _f(self, key):
@@ -242,9 +261,102 @@ class MainWindow(tk.Frame):
             return f"{self.result.method}, N={self.navconst_var.get():.2f}"
         return self.result.method
 
+    def _compute_efficiency(self):
+        if self.result is None or not self.result.states:
+            self.efficiency = None
+            self.efficiency_info.set("Нет данных")
+            return
+
+        distances = np.array([state.distance for state in self.result.states], dtype=float)
+        miss_values = np.array([state.params.get("miss_abs", np.nan) for state in self.result.states], dtype=float)
+        acc_values = np.array([abs(state.params.get("normal_acc_real", np.nan)) for state in self.result.states], dtype=float)
+
+        min_distance_idx = int(np.nanargmin(distances))
+        finite_miss = miss_values[np.isfinite(miss_values)]
+        finite_acc = acc_values[np.isfinite(acc_values)]
+
+        h_min = float(np.nanmin(finite_miss)) if finite_miss.size else None
+        h_avg = float(np.nanmean(finite_miss)) if finite_miss.size else None
+        a_max = float(np.nanmax(finite_acc)) if finite_acc.size else None
+
+        if self.result.hit:
+            rating = "высокая"
+            outcome = f"контакт, t = {self.result.hit_time:.2f} с"
+        elif self.result.stopped_by_divergence:
+            rating = "низкая"
+            outcome = "расхождение"
+        else:
+            rating = "не достигнута"
+            outcome = self.result.stop_reason
+
+        self.efficiency = {
+            "min_distance_idx": min_distance_idx,
+            "min_distance": float(distances[min_distance_idx]),
+            "min_distance_time": float(self.result.states[min_distance_idx].time),
+            "h_min": h_min,
+            "h_avg": h_avg,
+            "a_max": a_max,
+            "rating": rating,
+            "outcome": outcome,
+        }
+
+        a_line = "a_n max = нет данных" if a_max is None else f"a_n max = {a_max:.2f} м/с²"
+        h_min_line = "h_min = нет данных" if h_min is None else f"h_min = {h_min:.2f} м"
+        h_avg_line = "h_avg = нет данных" if h_avg is None else f"h_avg = {h_avg:.2f} м"
+        self.efficiency_info.set(
+            f"Эффективность: {rating}\n"
+            f"Итог: {outcome}\n"
+            f"R_min = {distances[min_distance_idx]:.2f} м при t = {self.result.states[min_distance_idx].time:.2f} с\n"
+            f"{h_min_line}\n"
+            f"{h_avg_line}\n"
+            f"{a_line}"
+        )
+
     def _redraw_if_ready(self):
         if self.result is not None:
             self._draw_step(self.current_step)
+
+    def _on_plot_scroll(self, event):
+        if event.inaxes != self.ax or event.xdata is None or event.ydata is None:
+            return
+        scale = 1 / 1.2 if event.button == "up" else 1.2
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+        x_span = (xlim[1] - xlim[0]) * scale
+        y_span = (ylim[1] - ylim[0]) * scale
+        rel_x = (event.xdata - xlim[0]) / (xlim[1] - xlim[0])
+        rel_y = (event.ydata - ylim[0]) / (ylim[1] - ylim[0])
+        self.ax.set_xlim(event.xdata - x_span * rel_x, event.xdata + x_span * (1.0 - rel_x))
+        self.ax.set_ylim(event.ydata - y_span * rel_y, event.ydata + y_span * (1.0 - rel_y))
+        self.canvas.draw_idle()
+
+    def _on_plot_button_press(self, event):
+        if event.inaxes != self.ax or event.button != 1 or event.xdata is None or event.ydata is None:
+            return
+        self._pan_start = {
+            "x": event.xdata,
+            "y": event.ydata,
+            "xlim": self.ax.get_xlim(),
+            "ylim": self.ax.get_ylim(),
+        }
+
+    def _on_plot_button_release(self, event):
+        if event.button == 1:
+            self._pan_start = None
+
+    def _on_plot_motion(self, event):
+        if self._pan_start is None or event.inaxes != self.ax or event.xdata is None or event.ydata is None:
+            return
+        dx = event.xdata - self._pan_start["x"]
+        dy = event.ydata - self._pan_start["y"]
+        xlim = self._pan_start["xlim"]
+        ylim = self._pan_start["ylim"]
+        self.ax.set_xlim(xlim[0] - dx, xlim[1] - dx)
+        self.ax.set_ylim(ylim[0] - dy, ylim[1] - dy)
+        now = time.monotonic()
+        if now - self._last_pan_draw >= 1.0 / 45.0:
+            self._last_pan_draw = now
+            self.canvas.draw_idle()
 
     def _update_nav_buttons(self):
         if self.result is None:
@@ -335,6 +447,7 @@ class MainWindow(tk.Frame):
                     )
 
             self.sampled_missile, self.sampled_target, self.sampled_times, self.sampled_state_idx = make_step_arrays(self.result)
+            self._compute_efficiency()
             self.current_step = 0
             self._draw_step(self.current_step)
             self._update_nav_buttons()
@@ -397,13 +510,25 @@ class MainWindow(tk.Frame):
 
         self.ax.plot(mp[:, 0], mp[:, 1], color="black", linewidth=1.8, label="Траектория ОУ")
         self.ax.plot(tp[:, 0], tp[:, 1], color="red", linewidth=1.6, linestyle="-", label="Траектория ОС")
-        self.ax.plot(mp[:, 0], mp[:, 1], linestyle="None", marker="o", color="black", ms=3, alpha=0.7)
-        self.ax.plot(tp[:, 0], tp[:, 1], linestyle="None", marker="o", color="red", ms=3, alpha=0.7)
+        self.ax.scatter(mp[:, 0], mp[:, 1], marker="o", color="black", s=9, alpha=0.7)
+        self.ax.scatter(tp[:, 0], tp[:, 1], marker="o", color="red", s=9, alpha=0.7)
 
-        for i in range(len(mp)):
+        los_segments = np.stack((mp, tp), axis=1)
+        self.ax.add_collection(
+            LineCollection(
+                los_segments,
+                colors="0.45",
+                linestyles=(0, (4, 4)),
+                linewidths=0.9,
+                alpha=0.9,
+                zorder=1,
+            )
+        )
+
+        label_stride = max(1, int(np.ceil(len(mp) / MAX_STEP_LABELS)))
+        for i in range(0, len(mp), label_stride):
             p_i = mp[i]
             c_i = tp[i]
-            self.ax.plot([p_i[0], c_i[0]], [p_i[1], c_i[1]], color="0.45", linestyle=(0, (4, 4)), linewidth=0.9, alpha=0.9, zorder=1)
             self.ax.text(p_i[0] + 55, p_i[1] - 85, f"Ос{i}", color="black", fontsize=9, alpha=0.95)
             self.ax.text(c_i[0] + 55, c_i[1] + 55, f"Оц{i}", color="red", fontsize=9, alpha=0.95)
             if self.show_miss_var.get() and i < len(self.sampled_state_idx):
@@ -434,6 +559,33 @@ class MainWindow(tk.Frame):
                     linewidth=1.2,
                 )
             )
+
+        if self.efficiency is not None:
+            min_idx = self.efficiency["min_distance_idx"]
+            if 0 <= min_idx < len(mp):
+                p_min = mp[min_idx]
+                c_min = tp[min_idx]
+                mid = (p_min + c_min) * 0.5
+                self.ax.plot(
+                    [p_min[0], c_min[0]],
+                    [p_min[1], c_min[1]],
+                    color="#2ca02c",
+                    linewidth=2.6,
+                    linestyle="-",
+                    zorder=9,
+                    label="Минимальная дистанция",
+                )
+                self.ax.plot([p_min[0], c_min[0]], [p_min[1], c_min[1]], linestyle="None", marker="o", color="#2ca02c", ms=7, zorder=10)
+                self.ax.text(
+                    mid[0] + 120,
+                    mid[1] + 120,
+                    f"R_min={self.efficiency['min_distance']:.1f} м",
+                    color="#2ca02c",
+                    fontsize=10,
+                    fontweight="bold",
+                    bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="#2ca02c", alpha=0.9),
+                    zorder=11,
+                )
 
         self._set_view_limits()
         self.ax.legend(loc="best")
@@ -685,6 +837,7 @@ class MainWindow(tk.Frame):
         self.sampled_times = None
         self.sampled_state_idx = None
         self.current_step = 0
+        self.efficiency = None
         self.ax.clear()
         self.ax.grid(True, alpha=0.45)
         self.ax.set_title("Дискретное графическое построение методов наведения")
@@ -694,3 +847,4 @@ class MainWindow(tk.Frame):
         self._update_nav_buttons()
         self.info.set("Очищено. Введите данные и постройте новую траекторию.")
         self.step_info.set("Нет данных")
+        self.efficiency_info.set("Нет данных")
