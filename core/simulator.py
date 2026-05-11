@@ -3,6 +3,8 @@ from dataclasses import dataclass, field
 import numpy as np
 from .math2d import normalize, norm, signed_angle_deg
 
+PROPORTIONAL_METHOD = "Пропорциональное наведение"
+
 @dataclass
 class State:
     missile_pos: np.ndarray
@@ -28,6 +30,23 @@ def _rotate(v: np.ndarray, angle_rad: float) -> np.ndarray:
     c = float(np.cos(angle_rad))
     s = float(np.sin(angle_rad))
     return np.array([c * v[0] - s * v[1], s * v[0] + c * v[1]], dtype=float)
+
+def _cross2(a: np.ndarray, b: np.ndarray) -> float:
+    return float(a[0] * b[1] - a[1] * b[0])
+
+def _miss_params(los: np.ndarray, relative_vel: np.ndarray, missile_speed: float) -> dict:
+    d = norm(los)
+    if d <= 1e-9:
+        los_rate = 0.0
+    else:
+        los_rate = _cross2(los, relative_vel) / (d * d)
+    miss = 0.0 if missile_speed <= 1e-9 else d * d * los_rate / missile_speed
+    return {
+        "los_rate_rad_s": los_rate,
+        "los_rate_deg_s": np.rad2deg(los_rate),
+        "miss_value": miss,
+        "miss_abs": abs(miss),
+    }
 
 def _limit_turn(prev_dir: np.ndarray, desired_dir: np.ndarray, speed: float, dt: float, max_normal_acc: float) -> np.ndarray:
     prev_dir = normalize(prev_dir)
@@ -105,10 +124,11 @@ def simulate_direct_discrete(
         jc = theta - eps
         q = signed_angle_deg(los_dir, mdir)
         q_c = signed_angle_deg(los_dir, normalize(target_ground))
+        miss = _miss_params(los, target_ground - missile_ground, missile_speed)
 
         _append_state(
             states, mp, missile_air, missile_ground, tp, target_ground, d, t,
-            dict(eps_deg=eps, theta_deg=theta, jc_deg=jc, q_deg=q, q_c_deg=q_c, delta=jc)
+            dict(eps_deg=eps, theta_deg=theta, jc_deg=jc, q_deg=q, q_c_deg=q_c, delta=jc, **miss)
         )
 
         if d <= hit_threshold:
@@ -192,10 +212,11 @@ def simulate_parallel_discrete(
         missile_ground = missile_air + wind
 
         delta = q_p - np.rad2deg(np.arcsin(ratio))
+        miss = _miss_params(los, target_ground - missile_ground, missile_speed)
 
         _append_state(
             states, mp, missile_air, missile_ground, tp, target_ground, d, t,
-            dict(eps_deg=eps, eps0_deg=eps0, q_p_deg=q_p, q_c_deg=q_c, delta=delta, theta_deg=theta)
+            dict(eps_deg=eps, eps0_deg=eps0, q_p_deg=q_p, q_c_deg=q_c, delta=delta, theta_deg=theta, **miss)
         )
 
         if d <= hit_threshold:
@@ -220,6 +241,111 @@ def simulate_parallel_discrete(
         t += dt
 
     return Result(states, hit, hit_idx, hit_time, stopped_by_divergence, stop_reason, "Параллельное сближение")
+
+def simulate_proportional_discrete(
+    missile_pos: np.ndarray,
+    missile_speed: float,
+    missile_course_dir: np.ndarray,
+    target_pos: np.ndarray,
+    target_speed: float,
+    target_course_dir: np.ndarray,
+    wind: np.ndarray,
+    dt: float,
+    t_max: float,
+    hit_threshold: float,
+    max_normal_acc: float,
+    navigation_constant: float = 3.0,
+) -> Result:
+    states: list[State] = []
+    t = 0.0
+    mp = missile_pos.copy()
+    tp = target_pos.copy()
+    tdir = normalize(target_course_dir)
+    mdir_prev = normalize(missile_course_dir)
+    nav_const = max(0.0, float(navigation_constant))
+
+    hit = False
+    hit_idx = -1
+    hit_time = t_max
+    stopped_by_divergence = False
+    stop_reason = "Достигнуто t_max"
+
+    steps = int(np.floor(t_max / dt)) + 1
+    prev_d: float | None = None
+    was_closing = False
+
+    for _ in range(steps):
+        los = tp - mp
+        d = norm(los)
+        los_dir = normalize(los)
+
+        target_air = tdir * target_speed
+        target_ground = target_air + wind
+        missile_ground_prev = mdir_prev * missile_speed + wind
+        relative_vel = target_ground - missile_ground_prev
+
+        if d <= 1e-9:
+            los_rate = 0.0
+        else:
+            los_rate = _cross2(los, relative_vel) / (d * d)
+        closing_speed = -float(np.dot(los_dir, relative_vel))
+        effective_closing_speed = max(0.0, closing_speed)
+        normal_acc_cmd = nav_const * effective_closing_speed * los_rate
+        omega_cmd = 0.0 if missile_speed <= 1e-9 else normal_acc_cmd / missile_speed
+
+        desired_dir = normalize(_rotate(mdir_prev, omega_cmd * dt))
+        mdir = _limit_turn(mdir_prev, desired_dir, missile_speed, dt, max_normal_acc)
+
+        missile_air = mdir * missile_speed
+        missile_ground = missile_air + wind
+        rel_after = target_ground - missile_ground
+
+        eps = signed_angle_deg(np.array([1.0, 0.0]), los_dir)
+        theta = signed_angle_deg(np.array([1.0, 0.0]), mdir)
+        q = signed_angle_deg(los_dir, mdir)
+        q_c = signed_angle_deg(-los_dir, normalize(target_ground))
+        miss = _miss_params(los, rel_after, missile_speed)
+        closing_after = -float(np.dot(los_dir, rel_after))
+        normal_acc_real = missile_speed * signed_angle_deg(mdir_prev, mdir) * np.pi / 180.0 / dt if dt > 1e-9 else 0.0
+
+        _append_state(
+            states, mp, missile_air, missile_ground, tp, target_ground, d, t,
+            dict(
+                eps_deg=eps,
+                theta_deg=theta,
+                q_deg=q,
+                q_c_deg=q_c,
+                closing_speed=closing_after,
+                nav_const=nav_const,
+                normal_acc_cmd=normal_acc_cmd,
+                normal_acc_real=normal_acc_real,
+                delta=normal_acc_cmd - normal_acc_real,
+                **miss,
+            )
+        )
+
+        if d <= hit_threshold:
+            hit = True
+            hit_idx = len(states) - 1
+            hit_time = t
+            stop_reason = "Условный контакт"
+            break
+
+        if prev_d is not None:
+            if d < prev_d - 1e-9:
+                was_closing = True
+            elif was_closing and d > prev_d + 1e-9:
+                stopped_by_divergence = True
+                stop_reason = "ОУ начал удаляться от ОС"
+                break
+
+        tp = tp + target_ground * dt
+        mp = mp + missile_ground * dt
+        mdir_prev = mdir.copy()
+        prev_d = d
+        t += dt
+
+    return Result(states, hit, hit_idx, hit_time, stopped_by_divergence, stop_reason, PROPORTIONAL_METHOD)
 
 def make_step_arrays(result: Result):
     idx = np.arange(len(result.states), dtype=int)

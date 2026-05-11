@@ -20,7 +20,7 @@ DEFAULT_VALUES = {
     "frame_delay_ms": 40.0,
     "target_sine_radius": 1500.0,
 }
-GUIDANCE_METHODS = ["Прямой метод"]
+GUIDANCE_METHODS = ["Прямой метод", "Параллельное сближение", "Пропорциональное наведение"]
 MODES = ["Полный расчет", "Пошаговая анимация"]
 SCENARIOS = [
     "Цель стоит",

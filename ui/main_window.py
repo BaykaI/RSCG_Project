@@ -11,8 +11,10 @@ from matplotlib.patches import Arc, RegularPolygon
 
 from core.math2d import vec, normalize, norm, from_deg, signed_angle_deg
 from core.simulator import (
+    PROPORTIONAL_METHOD,
     simulate_direct_discrete,
     simulate_parallel_discrete,
+    simulate_proportional_discrete,
     make_step_arrays,
 )
 
@@ -71,12 +73,14 @@ class MainWindow(tk.Frame):
 
         ttk.Label(left, text="Метод").grid(row=row, column=0, sticky="w", pady=2)
         self.method_var = tk.StringVar(value="Прямой метод")
-        ttk.Combobox(
+        self.method_combo = ttk.Combobox(
             left,
             textvariable=self.method_var,
-            values=["Прямой метод", "Параллельное сближение"],
+            values=["Прямой метод", "Параллельное сближение", PROPORTIONAL_METHOD],
             state="readonly",
-        ).grid(row=row, column=1, sticky="ew", pady=2)
+        )
+        self.method_combo.grid(row=row, column=1, sticky="ew", pady=2)
+        self.method_combo.bind("<<ComboboxSelected>>", lambda event: self._sync_method_controls())
         row += 1
 
         ttk.Separator(left, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=6)
@@ -110,6 +114,27 @@ class MainWindow(tk.Frame):
         entry("dt", "dt моделирования, с", "5")
         entry("tmax", "t_max, с", "120")
         entry("hit", "радиус условного контакта, м", "25")
+
+        self.navconst_label = ttk.Label(left, text="N наведения")
+        self.navconst_label.grid(row=row, column=0, sticky="w", pady=2)
+        self.navconst_frame = ttk.Frame(left)
+        self.navconst_frame.grid(row=row, column=1, sticky="ew", pady=2)
+        self.navconst_frame.columnconfigure(0, weight=1)
+        self.navconst_var = tk.DoubleVar(value=3.0)
+        self.navconst_label_var = tk.StringVar(value="3.00")
+
+        def update_navconst_label(value):
+            self.navconst_label_var.set(f"{float(value):.2f}")
+
+        ttk.Scale(
+            self.navconst_frame,
+            from_=3.0,
+            to=20.0,
+            variable=self.navconst_var,
+            command=update_navconst_label,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ttk.Label(self.navconst_frame, textvariable=self.navconst_label_var, width=5).grid(row=0, column=1, sticky="e")
+        row += 1
 
         ttk.Separator(left, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=6)
         row += 1
@@ -160,6 +185,9 @@ class MainWindow(tk.Frame):
         self.show_epsilon_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(left, text="Показывать угол ε", variable=self.show_epsilon_var, command=self._redraw_if_ready).grid(row=row, column=0, columnspan=2, sticky="w")
         row += 1
+        self.show_miss_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(left, text="Показывать промах h", variable=self.show_miss_var, command=self._redraw_if_ready).grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
 
         btns = ttk.Frame(left)
         btns.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(10, 6))
@@ -194,9 +222,25 @@ class MainWindow(tk.Frame):
         self.ax.grid(True, alpha=0.45)
         self.canvas = FigureCanvasTkAgg(self.fig, master=right)
         self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self._sync_method_controls()
 
     def _f(self, key):
         return float(self.vars[key].get().replace(",", ".").strip())
+
+    def _sync_method_controls(self):
+        if self.method_var.get() == PROPORTIONAL_METHOD:
+            self.navconst_label.grid()
+            self.navconst_frame.grid()
+        else:
+            self.navconst_label.grid_remove()
+            self.navconst_frame.grid_remove()
+
+    def _result_display_name(self):
+        if self.result is None:
+            return ""
+        if self.result.method == PROPORTIONAL_METHOD:
+            return f"{self.result.method}, N={self.navconst_var.get():.2f}"
+        return self.result.method
 
     def _redraw_if_ready(self):
         if self.result is not None:
@@ -237,7 +281,7 @@ class MainWindow(tk.Frame):
         if self.result is None or self.sampled_missile is None:
             return
         self.history.append({
-            "method": self.result.method,
+            "method": self._result_display_name(),
             "missile": self.sampled_missile.copy(),
             "target": self.sampled_target.copy(),
             "color": COLOR_MAP[self.history_color_var.get()],
@@ -247,8 +291,6 @@ class MainWindow(tk.Frame):
 
     def build_trajectory(self):
         try:
-            self._store_current_history()
-
             missile_pos = vec(self._f("mx"), self._f("mz"))
             missile_speed = self._f("mspeed")
             missile_course = from_deg(self._f("mcourse"))
@@ -263,18 +305,34 @@ class MainWindow(tk.Frame):
             tmax = self._f("tmax")
             hit = self._f("hit")
 
-            if self.method_var.get() == "Прямой метод":
+            method = self.method_var.get()
+            if method == "Прямой метод":
                 self.result = simulate_direct_discrete(
                     missile_pos, missile_speed, missile_course,
                     target_pos, target_speed, target_course,
                     wind, dt, tmax, hit, max_normal_acc
                 )
-            else:
+            elif method == "Параллельное сближение":
                 self.result = simulate_parallel_discrete(
                     missile_pos, missile_speed, missile_course,
                     target_pos, target_speed, target_course,
                     wind, dt, tmax, hit, max_normal_acc
                 )
+            else:
+                nav_const = self.navconst_var.get()
+                if nav_const >= 19.999:
+                    self.result = simulate_parallel_discrete(
+                        missile_pos, missile_speed, missile_course,
+                        target_pos, target_speed, target_course,
+                        wind, dt, tmax, hit, max_normal_acc
+                    )
+                else:
+                    self.result = simulate_proportional_discrete(
+                        missile_pos, missile_speed, missile_course,
+                        target_pos, target_speed, target_course,
+                        wind, dt, tmax, hit, max_normal_acc,
+                        nav_const
+                    )
 
             self.sampled_missile, self.sampled_target, self.sampled_times, self.sampled_state_idx = make_step_arrays(self.result)
             self.current_step = 0
@@ -287,7 +345,8 @@ class MainWindow(tk.Frame):
                 status = "Останов: ОУ начал удаляться от ОС."
             else:
                 status = f"Останов: {self.result.stop_reason}."
-            self.info.set(f"{self.result.method}. Число дискретных точек = {len(self.sampled_missile)}. {status}")
+            self.info.set(f"{self._result_display_name()}. Число дискретных точек = {len(self.sampled_missile)}. {status}")
+            self._store_current_history()
         except Exception as exc:
             messagebox.showerror("Ошибка", str(exc))
 
@@ -347,6 +406,20 @@ class MainWindow(tk.Frame):
             self.ax.plot([p_i[0], c_i[0]], [p_i[1], c_i[1]], color="0.45", linestyle=(0, (4, 4)), linewidth=0.9, alpha=0.9, zorder=1)
             self.ax.text(p_i[0] + 55, p_i[1] - 85, f"Ос{i}", color="black", fontsize=9, alpha=0.95)
             self.ax.text(c_i[0] + 55, c_i[1] + 55, f"Оц{i}", color="red", fontsize=9, alpha=0.95)
+            if self.show_miss_var.get() and i < len(self.sampled_state_idx):
+                state_i = self.result.states[self.sampled_state_idx[i]]
+                miss = state_i.params.get("miss_abs")
+                if miss is not None:
+                    mid = (p_i + c_i) * 0.5
+                    self.ax.text(
+                        mid[0] + 80,
+                        mid[1] - 120,
+                        f"h{i}={miss:.1f} м",
+                        color="#2ca02c",
+                        fontsize=8,
+                        bbox=dict(boxstyle="round,pad=0.18", facecolor="white", edgecolor="#2ca02c", alpha=0.82),
+                        zorder=8,
+                    )
 
         if self.result.hit:
             hit_pt = self.result.states[self.result.hit_index].target_pos
@@ -434,6 +507,8 @@ class MainWindow(tk.Frame):
             f"ε = {eps:.2f}°\n"
             f"ϑ = {theta:.2f}°\n"
             f"jц = {jc:.2f}°\n"
+            f"ωε = {state.params['los_rate_deg_s']:.3f}°/с\n"
+            f"h = {state.params['miss_abs']:.2f} м\n"
             f"Δ = {delta:.2f}°"
         )
         self.step_info.set(panel_text)
@@ -487,7 +562,64 @@ class MainWindow(tk.Frame):
             f"ϑр = {theta:.2f}°\n"
             f"qр = {q_p:.2f}°\n"
             f"qц = {q_c:.2f}°\n"
+            f"ωε = {state.params['los_rate_deg_s']:.3f}°/с\n"
+            f"h = {state.params['miss_abs']:.2f} м\n"
             f"Δ = {state.params['delta']:.2f}°"
+        )
+        self.step_info.set(panel_text)
+        self.ax.text(
+            0.02, 0.02, panel_text,
+            transform=self.ax.transAxes,
+            ha="left", va="bottom", fontsize=10,
+            bbox=dict(boxstyle="round,pad=0.35", facecolor="white", edgecolor="0.35", alpha=0.9),
+            zorder=20,
+        )
+
+    def _draw_proportional_step(self, state, step_idx, p, c):
+        los = c - p
+        los_dir = normalize(los)
+        vr = state.missile_ground_vel.copy()
+        vc = state.target_ground_vel.copy()
+
+        self.ax.plot([p[0]], [p[1]], "ko", ms=7, zorder=7)
+        self.ax.plot([c[0]], [c[1]], "o", color="red", ms=7, zorder=7)
+
+        if self.show_xg_var.get():
+            self.ax.plot([p[0] - 1400, p[0] + 2600], [p[1], p[1]], color="0.45", linestyle="--", linewidth=1.0)
+            self.ax.text(p[0] + 2650, p[1] + 20, "Xg", color="0.35", fontsize=10)
+
+        self.ax.plot([p[0], c[0]], [p[1], c[1]], color="#ff8c00", linewidth=1.5, zorder=6)
+        self.ax.text((p[0] + c[0]) * 0.5, (p[1] + c[1]) * 0.5 + 110, "ЛВ", color="#ff8c00", fontsize=11)
+
+        vr_end = p + normalize(vr) * 900.0
+        vc_end = c + normalize(vc) * 850.0
+        normal_dir = normalize(np.array([-vr[1], vr[0]], dtype=float))
+        if state.params.get("normal_acc_real", 0.0) < 0.0:
+            normal_dir = -normal_dir
+        acc_end = p + normal_dir * 700.0
+
+        self.ax.arrow(p[0], p[1], vr_end[0] - p[0], vr_end[1] - p[1], color="#1f77b4", width=2.8, head_width=42.0, length_includes_head=True, zorder=5)
+        self.ax.text(vr_end[0] + 35, vr_end[1] + 25, "Vр", color="#1f77b4", fontsize=11)
+        self.ax.arrow(c[0], c[1], vc_end[0] - c[0], vc_end[1] - c[1], color="red", width=2.6, head_width=40.0, length_includes_head=True, zorder=5)
+        self.ax.text(vc_end[0] + 35, vc_end[1] + 25, "Vц", color="red", fontsize=11)
+        self.ax.arrow(p[0], p[1], acc_end[0] - p[0], acc_end[1] - p[1], color="#2ca02c", width=2.4, head_width=38.0, length_includes_head=True, zorder=5)
+        self.ax.text(acc_end[0] + 35, acc_end[1] + 25, "a_n", color="#2ca02c", fontsize=11)
+
+        if self.show_epsilon_var.get():
+            self._draw_angle_arc(p, np.array([1.0, 0.0]), los_dir, 440.0, "#ff8c00", "ε", text_shift=(18.0, 12.0), linewidth=2.0)
+        self._draw_angle_arc(p, los_dir, normalize(vr), 560.0, "#0057b8", "qр", text_shift=(24.0, 20.0), linewidth=3.0, fontsize=13, min_visual_angle_deg=4.0)
+
+        panel_text = (
+            f"t = {self.sampled_times[step_idx]:.2f} с\n"
+            f"d = {state.distance:.2f} м\n"
+            f"N = {state.params['nav_const']:.2f}\n"
+            f"ε = {state.params['eps_deg']:.2f}°\n"
+            f"ϑр = {state.params['theta_deg']:.2f}°\n"
+            f"qр = {state.params['q_deg']:.2f}°\n"
+            f"λ_dot = {state.params['los_rate_deg_s']:.3f}°/с\n"
+            f"h = {state.params['miss_abs']:.2f} м\n"
+            f"Vсбл = {state.params['closing_speed']:.2f} м/с\n"
+            f"a_n = {state.params['normal_acc_real']:.2f} м/с²"
         )
         self.step_info.set(panel_text)
         self.ax.text(
@@ -511,8 +643,10 @@ class MainWindow(tk.Frame):
 
         if self.result.method == "Прямой метод":
             self._draw_direct_step(state, step_idx, p, c)
-        else:
+        elif self.result.method == "Параллельное сближение":
             self._draw_parallel_step(state, step_idx, p, c)
+        else:
+            self._draw_proportional_step(state, step_idx, p, c)
 
         self.canvas.draw()
 
