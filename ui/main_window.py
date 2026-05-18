@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import io
 import tkinter as tk
 import time
 from tkinter import ttk, messagebox
@@ -42,45 +44,205 @@ STYLE_MAP = {
 }
 MAX_STEP_LABELS = 60
 
-METHOD_DESCRIPTIONS = {
-    "Прямой метод": (
-        "Курс ОУ всегда направлен на текущее положение цели (вдоль ЛВ):\n"
-        "    desired_dir = (r_ц − r_р) / |r_ц − r_р|.\n"
-        "Ракета доворачивает к цели каждый шаг. При ветре путевая скорость "
-        "отклоняется от ЛВ — траектория сносится."
-    ),
-    DIRECT_LEAD_METHOD: (
-        "То же, что прямой метод, но курс смещён на постоянный угол упреждения ψ "
-        "от линии визирования:\n"
-        "    ϑ = ε + ψ,    desired_dir = R(ψ) · e_ЛВ.\n"
-        "ψ задаётся вручную."
-    ),
-    PURSUIT_METHOD: (
-        "Вдоль ЛВ выставляется путевая скорость ОУ (V_возд + W), а не курс. "
-        "Курс «крабится», компенсируя снос ветра: ищется k > 0 такое, что\n"
-        "    |k · e_ЛВ − W| = V_р,\n"
-        "и курс = (k · e_ЛВ − W) / V_р. При W = 0 совпадает с прямым методом."
-    ),
-    "Параллельное сближение": (
-        "ЛВ сохраняет начальное направление ε₀ (не вращается). Из закона синусов:\n"
-        "    q_р = arcsin((V_ц / V_р) · sin(q_ц)),\n"
-        "    ϑ = ε₀ + q_р.\n"
-        "Идеальная встреча — при сохранении угла визирования."
-    ),
-    PROPORTIONAL_METHOD: (
-        "Командное ускорение пропорционально скорости вращения ЛВ:\n"
-        "    a_n_cmd = N · V_сбл · λ̇.\n"
-        "N (3…20) — навигационная константа. Применяется в большинстве "
-        "современных самонаводящихся ракет. При N → ∞ метод сходится к "
-        "параллельному сближению."
-    ),
-    PD_METHOD: (
-        "Расширение пропорционального наведения дифференциальной составляющей:\n"
-        "    a_n_cmd = V_сбл · (Nп · λ̇ + Nд · λ̈),\n"
-        "    λ̈ ≈ (λ̇_t − λ̇_{t−dt}) / dt.\n"
-        "Дифференциальная часть упреждает ускорение цели и уменьшает промах "
-        "при манёврах."
-    ),
+METHOD_INFO = {
+    "Прямой метод": {
+        "section": "4.1",
+        "title": "Метод прямого наведения",
+        "definition": (
+            "Продольная ось ОУ O_PX_1 = OX_СВ связанной СК в каждый момент "
+            "времени должна совмещаться с направлением на цель; требуемый "
+            "угол q_T должен быть равен нулю."
+        ),
+        "formulas": [
+            (r"$\varphi_{\mathrm{Ц}} = \vartheta - \varepsilon$",
+             "(4) Взаимная связь углов"),
+            (r"$\varphi_{\mathrm{Ц}} = 0,\quad \vartheta = \varepsilon$",
+             "(5)–(6) Уравнение идеальной связи"),
+            (r"$\Delta = \varphi_{\mathrm{Ц}} = \vartheta - \varepsilon$",
+             "(7)–(8) Параметр рассогласования (алгоритм траекторного управления)"),
+        ],
+        "advantages": [
+            "инвариантность к дальности наведения и высоте полёта цели и ОУ",
+            "относительная простота КБА: измеряются непосредственно бортовые "
+            "пеленги φ_г и φ_в (БРЛС, РЛС, ТГС) или углы ϑ и ε с их "
+            "последующим вычитанием",
+            "возможность применения неподвижного координатора при совпадении "
+            "осей ОУ и координатора",
+        ],
+        "disadvantages": [
+            "ограниченность применения — только по неподвижным целям "
+            "(V_цели << V_ОУ)",
+            "низкая точность наведения — большие поперечные (нормальные) "
+            "перегрузки ОУ на конечном этапе наведения (даже по неподвижным "
+            "целям)",
+            "влияние ветра — искривление траектории за счёт сноса (кривизна "
+            "тем больше, чем меньше скорость ОУ и больше скорость ветра в "
+            "поперечном направлении)",
+        ],
+    },
+    DIRECT_LEAD_METHOD: {
+        "section": "4.2",
+        "title": "Метод прямого наведения с постоянным углом упреждения",
+        "definition": (
+            "В течение всего времени полёта ОУ угол между продольной осью и "
+            "линией визирования остаётся постоянным (развитие метода прямого "
+            "наведения)."
+        ),
+        "formulas": [
+            (r"$\varphi_{\mathrm{Ц}} = \varphi_0,\quad "
+             r"\vartheta - \varepsilon = \varphi_0$",
+             "(9)–(10) Уравнение идеальной связи"),
+            (r"$\Delta = \varphi_{\mathrm{Ц}} - \varphi_0 = "
+             r"\vartheta - \varepsilon - \varphi_0$",
+             "(11)–(12) Параметр рассогласования"),
+        ],
+        "notes": (
+            "Метод обеспечивает меньшую кривизну траектории. Реализация — "
+            "аналогична прямому методу."
+        ),
+    },
+    PURSUIT_METHOD: {
+        "section": "4.3",
+        "title": "Метод погони (флюгерный метод)",
+        "definition": (
+            "Метод погони — с ЛВ «ОУ–цель» непрерывно совмещается вектор "
+            "скорости ОУ. Флюгерный метод — с ЛВ непрерывно совмещается "
+            "вектор воздушной скорости ОУ. При движении ОУ в невозмущённой "
+            "атмосфере оба метода идентичны."
+        ),
+        "formulas": [
+            (r"$q = 0,\quad \theta = \varepsilon,\quad "
+             r"\varphi_{\mathrm{Ц}} = \alpha$",
+             "(13)–(15) Уравнение идеальной связи"),
+            (r"$\Delta = q = \theta - \varepsilon = "
+             r"\varphi_{\mathrm{Ц}} - \alpha$",
+             "(16)–(18) Параметр рассогласования"),
+        ],
+        "notes": (
+            "Особенности: ОУ независимо от своего начального положения "
+            "стремится выйти строго «в хвост» цели; при α = 0 (β = 0) метод "
+            "вырождается в метод прямого наведения."
+        ),
+        "advantages": [
+            "инвариантность к дальности наведения и высоте полёта цели и ОУ",
+            "компенсирует наличие угла атаки и скольжения",
+        ],
+        "disadvantages": [
+            "ограниченность применения — только по неподвижным целям и при "
+            "отсутствии ветра",
+            "искривление траектории за счёт движения цели или бокового ветра",
+            "несовпадение мгновенного направления взаимного перемещения с "
+            "направлением на цель — необходимость угла упреждения "
+            "(треугольник скоростей)",
+            "кривизна траектории тем больше, чем больше скорость ОУ и "
+            "скорость цели (ветра) в поперечном направлении",
+            "увеличение ошибок и времени наведения, уменьшение дальности "
+            "действия, сложность маневра в диапазоне допустимых перегрузок "
+            "на среднем и конечном этапах наведения",
+            "усложнение КБА по сравнению с реализацией прямого метода: "
+            "измерение φ_Ц и угла атаки/скольжения (углометр БРЛС, РЛС, "
+            "ТГС; ФД — флюгерный датчик)",
+        ],
+    },
+    "Параллельное сближение": {
+        "section": "4.4",
+        "title": "Метод параллельного сближения (в мгновенную точку встречи)",
+        "definition": (
+            "В любой момент времени вектор скорости ОУ направлен в "
+            "упреждённую точку (линия визирования перемещается параллельно "
+            "сама себе)."
+        ),
+        "formulas": [
+            (r"$\omega = \dot{\varepsilon} = "
+             r"\dfrac{V_P \sin q_P - V_{\mathrm{Ц}} \sin q_{\mathrm{Ц}}}{R} "
+             r"\approx 0$",
+             "(19) Условие выполнения"),
+            (r"$\dot{\varepsilon} = 0,\quad \varepsilon = \varepsilon_{R_0}$",
+             "(20)–(21) Уравнение метода (вариант)"),
+            (r"$q_{P\mathrm{T}} \approx "
+             r"\dfrac{V_{\mathrm{Ц}}}{V_P}\,\sin q_{\mathrm{Ц}}$",
+             "(22) Уравнение метода (вариант)"),
+            (r"$\Delta = \dot{\varepsilon}$",
+             "(23) Параметр рассогласования (вариант)"),
+            (r"$\Delta = \varepsilon - \varepsilon_{D_0}$",
+             "(24) Параметр рассогласования (вариант)"),
+            (r"$V_{\mathrm{Ц}} \sin q_{\mathrm{Ц}} = V_P \sin q_P$",
+             "(25)"),
+            (r"$\Delta = q_P - "
+             r"\dfrac{V_{\mathrm{Ц}}}{V_P}\,\sin q_{\mathrm{Ц}}$",
+             "(26) Параметр рассогласования (вариант)"),
+        ],
+        "notes": (
+            "При наведении на неманеврирующую цель траектория ОУ "
+            "прямолинейна. Для реализации метода необходим состав "
+            "измерителей (датчиков), аналогичный реализации метода погони."
+        ),
+    },
+    PROPORTIONAL_METHOD: {
+        "section": "4.5",
+        "title": "Метод пропорционального наведения",
+        "definition": (
+            "Вариант 1: в любой момент времени угловая скорость вращения "
+            "вектора скорости ОУ в плоскости управления должна быть "
+            "пропорциональна угловой скорости линии визирования ОУ–Ц.\n"
+            "Вариант 2: в любой момент времени нормальное (боковое) "
+            "ускорение ОУ в плоскости управления должно быть пропорционально "
+            "угловой скорости линии визирования ОУ–Ц и скорости ОУ."
+        ),
+        "formulas": [
+            (r"$J^{\mathrm{Треб}}_{\mathrm{УР}} = "
+             r"N_0\,|\dot{r}|\,\omega + 1{,}5\,J_{\mathrm{Ц}}$",
+             "(27) Оптимальное уравнение (согласно ТОУ)"),
+            (r"$^{*}J^{\mathrm{Треб}}_{\mathrm{УР}} = "
+             r"N_0\,|\dot{r}|\,\omega$",
+             "(28) Упрощённое уравнение (цель равномерно прямолинейно)"),
+            (r"$\Delta = N_0\,|\dot{r}|\,\omega + 1{,}5\,J_{\mathrm{Ц}} "
+             r"- J_{\mathrm{УР}}$",
+             "(29) Параметр рассогласования (оптимальный)"),
+            (r"$^{*}\Delta = N_0\,|\dot{r}|\,\omega - J_{\mathrm{УР}}$",
+             "(30) Параметр рассогласования (упрощённый)"),
+            (r"$\dot{\theta} = "
+             r"\dfrac{N_0\,|\dot{r}|}{V_{\mathrm{УР}}}\,\omega = C\,\omega$",
+             "(31) Формулировка через угловую скорость (вариант 1)"),
+            (r"$\Delta = \dot{\theta} - C\,\omega$",
+             "(33) Параметр рассогласования (вариант 1)"),
+            (r"$J^{\mathrm{Треб}}_{\mathrm{УР}} = "
+             r"C\,V_{\mathrm{УР}}\,\omega = N_0\,|\dot{r}|\,\omega$",
+             "(35) Формулировка через нормальное ускорение (вариант 2)"),
+            (r"$\Delta = C\,V_{\mathrm{УР}}\,\omega - J_{\mathrm{УР}}$",
+             "(36) Параметр рассогласования (вариант 2)"),
+        ],
+        "notes": (
+            "N_0 = 3 — навигационная постоянная; ṙ — скорость сближения; "
+            "J_Ц — нормальное (боковое) ускорение цели. При пропорциональном "
+            "наведении управление безынерционного объекта формируется "
+            "пропорционально ускорению цели J_Ц."
+        ),
+    },
+    PD_METHOD: {
+        "section": "4.5",
+        "title": "Пропорционально-дифференциальный метод (расширение 4.5)",
+        "definition": (
+            "Расширение пропорционального наведения дифференциальной "
+            "составляющей: к слагаемому N_0·|ṙ|·ω добавляется численная "
+            "оценка λ̈ — производной угловой скорости ЛВ, упреждающая "
+            "ускорение цели (по смыслу аналогично слагаемому 1,5·J_Ц "
+            "в оптимальном уравнении 4.5)."
+        ),
+        "formulas": [
+            (r"$J^{\mathrm{Треб}}_{\mathrm{УР}} = "
+             r"N_0\,|\dot{r}|\,\omega + 1{,}5\,J_{\mathrm{Ц}}$",
+             "(27) Оптимальное уравнение пропорционального наведения"),
+            (r"$^{*}J^{\mathrm{Треб}}_{\mathrm{УР}} = "
+             r"N_0\,|\dot{r}|\,\omega$",
+             "(28) Упрощённое уравнение пропорционального наведения"),
+        ],
+        "notes": (
+            "Дифференциальная часть упреждает ускорение цели и уменьшает "
+            "промах при манёврах (раздел 4.5 семинара рассматривает "
+            "оптимальный и упрощённый варианты)."
+        ),
+    },
 }
 
 class MainWindow(tk.Frame):
@@ -97,6 +259,7 @@ class MainWindow(tk.Frame):
         self._pan_start = None
         self._last_pan_draw = 0.0
         self.history = []
+        self._formula_cache: dict = {}
         self._build_ui()
 
     def _build_ui(self):
@@ -166,19 +329,39 @@ class MainWindow(tk.Frame):
 
         desc_container, desc_body, desc_header = self._make_collapsible(left, "Описание метода")
         desc_container.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(2, 6))
-        self._bind_help(desc_header, "Краткое описание выбранного метода с ключевой формулой. ЛКМ по заголовку — свернуть/развернуть.")
-        self.method_description_var = tk.StringVar(value=METHOD_DESCRIPTIONS["Прямой метод"])
-        self.method_description_label = ttk.Label(
-            desc_body,
-            textvariable=self.method_description_var,
-            justify="left",
-            wraplength=400,
-            relief="solid",
-            padding=8,
-            foreground="#333",
+        self._bind_help(desc_header, "Описание выбранного метода с формулами (по материалам семинара 3). ЛКМ по заголовку — свернуть/развернуть.")
+
+        desc_frame = tk.Frame(desc_body, relief="solid", borderwidth=1, bg="#bda842")
+        desc_frame.grid(row=0, column=0, sticky="ew")
+        desc_frame.columnconfigure(0, weight=1)
+        desc_frame.rowconfigure(0, weight=1)
+
+        self.method_description_text = tk.Text(
+            desc_frame,
+            width=48,
+            height=18,
+            wrap="word",
+            relief="flat",
+            padx=8,
+            pady=8,
+            font=("TkDefaultFont", 9),
+            bg="#fffbf2",
+            fg="#222",
+            cursor="arrow",
+            spacing1=2,
+            spacing3=2,
         )
-        self.method_description_label.grid(row=0, column=0, sticky="ew")
-        self._bind_help(self.method_description_label, "Краткое описание выбранного метода: основная идея и ключевая формула.")
+        self.method_description_text.grid(row=0, column=0, sticky="nsew", padx=1, pady=1)
+        desc_scroll = ttk.Scrollbar(desc_frame, orient="vertical", command=self.method_description_text.yview)
+        desc_scroll.grid(row=0, column=1, sticky="ns", padx=(0, 1), pady=1)
+        self.method_description_text.configure(yscrollcommand=desc_scroll.set)
+        self.method_description_text.tag_configure("title", font=("TkDefaultFont", 10, "bold"), foreground="#1a4a8a", spacing3=4)
+        self.method_description_text.tag_configure("subhead", font=("TkDefaultFont", 9, "bold"), foreground="#444", spacing1=4, spacing3=2)
+        self.method_description_text.tag_configure("caption", foreground="#555", font=("TkDefaultFont", 8, "italic"), lmargin1=12, lmargin2=12)
+        self.method_description_text.tag_configure("body", foreground="#222", lmargin1=0, lmargin2=0)
+        self.method_description_text.tag_configure("bullet", foreground="#222", lmargin1=12, lmargin2=24)
+        self.method_description_text.configure(state="disabled")
+        self._bind_help(self.method_description_text, "Описание выбранного метода: определение, формулы, достоинства и недостатки (по семинару 3).")
         row += 1
 
         ttk.Separator(left, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=6)
@@ -593,10 +776,79 @@ class MainWindow(tk.Frame):
         else:
             self.lead_angle_label.grid_remove()
             self.lead_angle_entry.grid_remove()
-        if hasattr(self, "method_description_var"):
-            self.method_description_var.set(
-                METHOD_DESCRIPTIONS.get(method, "Описание для метода не задано.")
-            )
+        if hasattr(self, "method_description_text"):
+            self._populate_description(method)
+
+    def _render_formula(self, latex: str, fontsize: int = 12,
+                        color: str = "#222", bg: str = "#fffbf2") -> tk.PhotoImage:
+        cache_key = (latex, fontsize, color, bg)
+        cached = self._formula_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        fig = Figure(figsize=(8.0, 1.0), dpi=130)
+        fig.patch.set_facecolor(bg)
+        fig.text(0.02, 0.5, latex, fontsize=fontsize, color=color,
+                 va="center", ha="left")
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight",
+                    pad_inches=0.06, facecolor=bg)
+        data = base64.b64encode(buf.getvalue()).decode("ascii")
+        photo = tk.PhotoImage(data=data)
+        self._formula_cache[cache_key] = photo
+        return photo
+
+    def _populate_description(self, method: str) -> None:
+        info = METHOD_INFO.get(method)
+        txt = self.method_description_text
+        txt.configure(state="normal")
+        txt.delete("1.0", "end")
+
+        if info is None:
+            txt.insert("end", "Описание для метода не задано.", "body")
+            txt.configure(state="disabled")
+            return
+
+        section = info.get("section", "")
+        title = info.get("title", method)
+        header = f"{section}. {title}" if section else title
+        txt.insert("end", f"{header}\n", "title")
+
+        definition = info.get("definition")
+        if definition:
+            txt.insert("end", "\nОпределение.\n", "subhead")
+            txt.insert("end", f"{definition}\n", "body")
+
+        formulas = info.get("formulas") or []
+        if formulas:
+            txt.insert("end", "\nФормулы:\n", "subhead")
+            for latex, caption in formulas:
+                try:
+                    img = self._render_formula(latex)
+                    txt.image_create("end", image=img, padx=6, pady=2)
+                    txt.insert("end", "\n")
+                except Exception:
+                    txt.insert("end", f"{latex}\n", "body")
+                if caption:
+                    txt.insert("end", f"{caption}\n", "caption")
+
+        notes = info.get("notes")
+        if notes:
+            txt.insert("end", "\nПримечания.\n", "subhead")
+            txt.insert("end", f"{notes}\n", "body")
+
+        advantages = info.get("advantages") or []
+        if advantages:
+            txt.insert("end", "\nДостоинства:\n", "subhead")
+            for item in advantages:
+                txt.insert("end", f"• {item}\n", "bullet")
+
+        disadvantages = info.get("disadvantages") or []
+        if disadvantages:
+            txt.insert("end", "\nНедостатки:\n", "subhead")
+            for item in disadvantages:
+                txt.insert("end", f"• {item}\n", "bullet")
+
+        txt.configure(state="disabled")
 
     def _result_display_name(self):
         if self.result is None:
