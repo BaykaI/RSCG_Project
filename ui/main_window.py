@@ -14,9 +14,15 @@ from matplotlib.patches import Arc, RegularPolygon
 from core.math2d import vec, normalize, norm, from_deg, signed_angle_deg
 from core.simulator import (
     PROPORTIONAL_METHOD,
+    DIRECT_LEAD_METHOD,
+    PURSUIT_METHOD,
+    PD_METHOD,
     simulate_direct_discrete,
+    simulate_direct_lead_discrete,
+    simulate_pursuit_discrete,
     simulate_parallel_discrete,
     simulate_proportional_discrete,
+    simulate_pd_discrete,
     make_step_arrays,
 )
 
@@ -82,7 +88,14 @@ class MainWindow(tk.Frame):
         self.method_combo = ttk.Combobox(
             left,
             textvariable=self.method_var,
-            values=["Прямой метод", "Параллельное сближение", PROPORTIONAL_METHOD],
+            values=[
+                "Прямой метод",
+                DIRECT_LEAD_METHOD,
+                PURSUIT_METHOD,
+                "Параллельное сближение",
+                PROPORTIONAL_METHOD,
+                PD_METHOD,
+            ],
             state="readonly",
         )
         self.method_combo.grid(row=row, column=1, sticky="ew", pady=2)
@@ -140,6 +153,34 @@ class MainWindow(tk.Frame):
             command=update_navconst_label,
         ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
         ttk.Label(self.navconst_frame, textvariable=self.navconst_label_var, width=5).grid(row=0, column=1, sticky="e")
+        row += 1
+
+        self.lead_angle_label = ttk.Label(left, text="ψ упреждения, град")
+        self.lead_angle_label.grid(row=row, column=0, sticky="w", pady=2)
+        self.lead_angle_var = tk.StringVar(value="10")
+        self.lead_angle_entry = ttk.Entry(left, textvariable=self.lead_angle_var, width=18)
+        self.lead_angle_entry.grid(row=row, column=1, sticky="ew", pady=2)
+        row += 1
+
+        self.navconst_d_label = ttk.Label(left, text="Nд (дифф.)")
+        self.navconst_d_label.grid(row=row, column=0, sticky="w", pady=2)
+        self.navconst_d_frame = ttk.Frame(left)
+        self.navconst_d_frame.grid(row=row, column=1, sticky="ew", pady=2)
+        self.navconst_d_frame.columnconfigure(0, weight=1)
+        self.navconst_d_var = tk.DoubleVar(value=0.5)
+        self.navconst_d_label_var = tk.StringVar(value="0.50")
+
+        def update_navconst_d_label(value):
+            self.navconst_d_label_var.set(f"{float(value):.2f}")
+
+        ttk.Scale(
+            self.navconst_d_frame,
+            from_=0.0,
+            to=5.0,
+            variable=self.navconst_d_var,
+            command=update_navconst_d_label,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ttk.Label(self.navconst_d_frame, textvariable=self.navconst_d_label_var, width=5).grid(row=0, column=1, sticky="e")
         row += 1
 
         ttk.Separator(left, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=6)
@@ -247,18 +288,39 @@ class MainWindow(tk.Frame):
         return float(self.vars[key].get().replace(",", ".").strip())
 
     def _sync_method_controls(self):
-        if self.method_var.get() == PROPORTIONAL_METHOD:
+        method = self.method_var.get()
+        if method in (PROPORTIONAL_METHOD, PD_METHOD):
             self.navconst_label.grid()
             self.navconst_frame.grid()
         else:
             self.navconst_label.grid_remove()
             self.navconst_frame.grid_remove()
+        if method == PD_METHOD:
+            self.navconst_d_label.grid()
+            self.navconst_d_frame.grid()
+        else:
+            self.navconst_d_label.grid_remove()
+            self.navconst_d_frame.grid_remove()
+        if method == DIRECT_LEAD_METHOD:
+            self.lead_angle_label.grid()
+            self.lead_angle_entry.grid()
+        else:
+            self.lead_angle_label.grid_remove()
+            self.lead_angle_entry.grid_remove()
 
     def _result_display_name(self):
         if self.result is None:
             return ""
         if self.result.method == PROPORTIONAL_METHOD:
             return f"{self.result.method}, N={self.navconst_var.get():.2f}"
+        if self.result.method == PD_METHOD:
+            return f"{self.result.method}, Nп={self.navconst_var.get():.2f}, Nд={self.navconst_d_var.get():.2f}"
+        if self.result.method == DIRECT_LEAD_METHOD:
+            try:
+                lead = float(self.lead_angle_var.get().replace(",", ".").strip())
+            except ValueError:
+                lead = 0.0
+            return f"{self.result.method}, ψ={lead:.2f}°"
         return self.result.method
 
     def _compute_efficiency(self):
@@ -424,11 +486,33 @@ class MainWindow(tk.Frame):
                     target_pos, target_speed, target_course,
                     wind, dt, tmax, hit, max_normal_acc
                 )
+            elif method == DIRECT_LEAD_METHOD:
+                lead_angle = float(self.lead_angle_var.get().replace(",", ".").strip())
+                self.result = simulate_direct_lead_discrete(
+                    missile_pos, missile_speed, missile_course,
+                    target_pos, target_speed, target_course,
+                    wind, dt, tmax, hit, max_normal_acc,
+                    lead_angle
+                )
+            elif method == PURSUIT_METHOD:
+                self.result = simulate_pursuit_discrete(
+                    missile_pos, missile_speed, missile_course,
+                    target_pos, target_speed, target_course,
+                    wind, dt, tmax, hit, max_normal_acc
+                )
             elif method == "Параллельное сближение":
                 self.result = simulate_parallel_discrete(
                     missile_pos, missile_speed, missile_course,
                     target_pos, target_speed, target_course,
                     wind, dt, tmax, hit, max_normal_acc
+                )
+            elif method == PD_METHOD:
+                self.result = simulate_pd_discrete(
+                    missile_pos, missile_speed, missile_course,
+                    target_pos, target_speed, target_course,
+                    wind, dt, tmax, hit, max_normal_acc,
+                    self.navconst_var.get(),
+                    self.navconst_d_var.get()
                 )
             else:
                 nav_const = self.navconst_var.get()
@@ -782,6 +866,174 @@ class MainWindow(tk.Frame):
             zorder=20,
         )
 
+    def _draw_direct_lead_step(self, state, step_idx, p, c):
+        los = c - p
+        los_dir = normalize(los)
+        vr_dir = normalize(state.missile_air_vel)
+        vt_dir = normalize(state.target_ground_vel)
+
+        self.ax.plot([p[0]], [p[1]], "ko", ms=7, zorder=7)
+        self.ax.plot([c[0]], [c[1]], "o", color="red", ms=7, zorder=7)
+
+        if self.show_xg_var.get():
+            self.ax.plot([p[0] - 1600, p[0] + 2600], [p[1], p[1]], color="0.45", linestyle="--", linewidth=1.1)
+            self.ax.text(p[0] + 2650, p[1] + 20, "OXg", color="0.35", fontsize=10)
+
+        self.ax.plot([p[0], c[0]], [p[1], c[1]], color="#ff8c00", linewidth=1.6, linestyle="-", zorder=6)
+        self.ax.text((p[0] + c[0]) * 0.5, (p[1] + c[1]) * 0.5 + 120, "ЛВ", color="#ff8c00", fontsize=11)
+
+        vr_end = p + vr_dir * 900.0
+        self.ax.arrow(p[0], p[1], vr_end[0] - p[0], vr_end[1] - p[1], color="#1f77b4", width=2.8, head_width=42.0, length_includes_head=True, zorder=5)
+        self.ax.text(vr_end[0] + 35, vr_end[1] + 25, "Vр", color="#1f77b4", fontsize=11)
+
+        vt_end = c + vt_dir * 850.0
+        self.ax.arrow(c[0], c[1], vt_end[0] - c[0], vt_end[1] - c[1], color="red", width=2.6, head_width=40.0, length_includes_head=True, zorder=5)
+        self.ax.text(vt_end[0] + 40, vt_end[1] + 35, "Vц", color="red", fontsize=11)
+
+        eps = state.params["eps_deg"]
+        theta = state.params["theta_deg"]
+        jc = state.params["jc_deg"]
+        lead = state.params.get("lead_angle_deg", 0.0)
+        delta = state.params["delta"]
+        if self.show_epsilon_var.get():
+            self._draw_angle_arc(p, np.array([1.0, 0.0]), los_dir, 380.0, "#ff8c00", "ε", text_shift=(18.0, 12.0), linewidth=2.0)
+        self._draw_angle_arc(p, los_dir, vr_dir, 560.0, "#0057b8", "ψ", text_shift=(24.0, 20.0), linewidth=3.0, fontsize=13, min_visual_angle_deg=4.0)
+
+        panel_text = (
+            f"t = {self.sampled_times[step_idx]:.2f} с\n"
+            f"d = {state.distance:.2f} м\n"
+            f"ψ = {lead:.2f}°\n"
+            f"ε = {eps:.2f}°\n"
+            f"ϑ = {theta:.2f}°\n"
+            f"jц = {jc:.2f}°\n"
+            f"ωε = {state.params['los_rate_deg_s']:.3f}°/с\n"
+            f"h = {state.params['miss_abs']:.2f} м\n"
+            f"Δ = {delta:.2f}°"
+        )
+        self.step_info.set(panel_text)
+        self.ax.text(
+            0.02, 0.02, panel_text,
+            transform=self.ax.transAxes,
+            ha="left", va="bottom", fontsize=10,
+            bbox=dict(boxstyle="round,pad=0.35", facecolor="white", edgecolor="0.35", alpha=0.9),
+            zorder=20,
+        )
+
+    def _draw_pursuit_step(self, state, step_idx, p, c):
+        los = c - p
+        los_dir = normalize(los)
+        vr_air_dir = normalize(state.missile_air_vel)
+        vr_ground_dir = normalize(state.missile_ground_vel)
+        vt_dir = normalize(state.target_ground_vel)
+
+        self.ax.plot([p[0]], [p[1]], "ko", ms=7, zorder=7)
+        self.ax.plot([c[0]], [c[1]], "o", color="red", ms=7, zorder=7)
+
+        if self.show_xg_var.get():
+            self.ax.plot([p[0] - 1600, p[0] + 2600], [p[1], p[1]], color="0.45", linestyle="--", linewidth=1.1)
+            self.ax.text(p[0] + 2650, p[1] + 20, "OXg", color="0.35", fontsize=10)
+
+        self.ax.plot([p[0], c[0]], [p[1], c[1]], color="#ff8c00", linewidth=1.6, linestyle="-", zorder=6)
+        self.ax.text((p[0] + c[0]) * 0.5, (p[1] + c[1]) * 0.5 + 120, "ЛВ", color="#ff8c00", fontsize=11)
+
+        vr_end = p + vr_air_dir * 900.0
+        vg_end = p + vr_ground_dir * 950.0
+        self.ax.arrow(p[0], p[1], vr_end[0] - p[0], vr_end[1] - p[1], color="#1f77b4", width=2.8, head_width=42.0, length_includes_head=True, zorder=5)
+        self.ax.text(vr_end[0] + 35, vr_end[1] + 25, "Vр (курс)", color="#1f77b4", fontsize=11)
+        self.ax.arrow(p[0], p[1], vg_end[0] - p[0], vg_end[1] - p[1], color="#2ca02c", width=2.2, head_width=38.0, length_includes_head=True, zorder=5, alpha=0.9)
+        self.ax.text(vg_end[0] + 35, vg_end[1] - 60, "Vпут", color="#2ca02c", fontsize=11)
+
+        vt_end = c + vt_dir * 850.0
+        self.ax.arrow(c[0], c[1], vt_end[0] - c[0], vt_end[1] - c[1], color="red", width=2.6, head_width=40.0, length_includes_head=True, zorder=5)
+        self.ax.text(vt_end[0] + 40, vt_end[1] + 35, "Vц", color="red", fontsize=11)
+
+        eps = state.params["eps_deg"]
+        theta = state.params["theta_deg"]
+        gamma = state.params.get("gamma_deg", theta)
+        q = state.params["q_deg"]
+        delta = state.params["delta"]
+        if self.show_epsilon_var.get():
+            self._draw_angle_arc(p, np.array([1.0, 0.0]), los_dir, 380.0, "#ff8c00", "ε", text_shift=(18.0, 12.0), linewidth=2.0)
+        self._draw_angle_arc(p, los_dir, vr_air_dir, 560.0, "#0057b8", "ϑ−ε", text_shift=(24.0, 20.0), linewidth=2.4, fontsize=12, min_visual_angle_deg=4.0)
+
+        panel_text = (
+            f"t = {self.sampled_times[step_idx]:.2f} с\n"
+            f"d = {state.distance:.2f} м\n"
+            f"ε = {eps:.2f}°\n"
+            f"ϑ = {theta:.2f}°\n"
+            f"γ (путевой) = {gamma:.2f}°\n"
+            f"q (Vпут к ЛВ) = {q:.2f}°\n"
+            f"ωε = {state.params['los_rate_deg_s']:.3f}°/с\n"
+            f"h = {state.params['miss_abs']:.2f} м\n"
+            f"Δ = γ − ε = {delta:.2f}°"
+        )
+        self.step_info.set(panel_text)
+        self.ax.text(
+            0.02, 0.02, panel_text,
+            transform=self.ax.transAxes,
+            ha="left", va="bottom", fontsize=10,
+            bbox=dict(boxstyle="round,pad=0.35", facecolor="white", edgecolor="0.35", alpha=0.9),
+            zorder=20,
+        )
+
+    def _draw_pd_step(self, state, step_idx, p, c):
+        los = c - p
+        los_dir = normalize(los)
+        vr = state.missile_ground_vel.copy()
+        vc = state.target_ground_vel.copy()
+
+        self.ax.plot([p[0]], [p[1]], "ko", ms=7, zorder=7)
+        self.ax.plot([c[0]], [c[1]], "o", color="red", ms=7, zorder=7)
+
+        if self.show_xg_var.get():
+            self.ax.plot([p[0] - 1400, p[0] + 2600], [p[1], p[1]], color="0.45", linestyle="--", linewidth=1.0)
+            self.ax.text(p[0] + 2650, p[1] + 20, "Xg", color="0.35", fontsize=10)
+
+        self.ax.plot([p[0], c[0]], [p[1], c[1]], color="#ff8c00", linewidth=1.5, zorder=6)
+        self.ax.text((p[0] + c[0]) * 0.5, (p[1] + c[1]) * 0.5 + 110, "ЛВ", color="#ff8c00", fontsize=11)
+
+        vr_end = p + normalize(vr) * 900.0
+        vc_end = c + normalize(vc) * 850.0
+        normal_dir = normalize(np.array([-vr[1], vr[0]], dtype=float))
+        if state.params.get("normal_acc_real", 0.0) < 0.0:
+            normal_dir = -normal_dir
+        acc_end = p + normal_dir * 700.0
+
+        self.ax.arrow(p[0], p[1], vr_end[0] - p[0], vr_end[1] - p[1], color="#1f77b4", width=2.8, head_width=42.0, length_includes_head=True, zorder=5)
+        self.ax.text(vr_end[0] + 35, vr_end[1] + 25, "Vр", color="#1f77b4", fontsize=11)
+        self.ax.arrow(c[0], c[1], vc_end[0] - c[0], vc_end[1] - c[1], color="red", width=2.6, head_width=40.0, length_includes_head=True, zorder=5)
+        self.ax.text(vc_end[0] + 35, vc_end[1] + 25, "Vц", color="red", fontsize=11)
+        self.ax.arrow(p[0], p[1], acc_end[0] - p[0], acc_end[1] - p[1], color="#2ca02c", width=2.4, head_width=38.0, length_includes_head=True, zorder=5)
+        self.ax.text(acc_end[0] + 35, acc_end[1] + 25, "a_n", color="#2ca02c", fontsize=11)
+
+        if self.show_epsilon_var.get():
+            self._draw_angle_arc(p, np.array([1.0, 0.0]), los_dir, 440.0, "#ff8c00", "ε", text_shift=(18.0, 12.0), linewidth=2.0)
+        self._draw_angle_arc(p, los_dir, normalize(vr), 560.0, "#0057b8", "qр", text_shift=(24.0, 20.0), linewidth=3.0, fontsize=13, min_visual_angle_deg=4.0)
+
+        lambda_dot_deg = float(np.rad2deg(state.params.get("lambda_dot_rad_s", 0.0)))
+        lambda_ddot_deg = float(np.rad2deg(state.params.get("lambda_ddot_rad_s2", 0.0)))
+        panel_text = (
+            f"t = {self.sampled_times[step_idx]:.2f} с\n"
+            f"d = {state.distance:.2f} м\n"
+            f"Nп = {state.params['nav_const_p']:.2f}, Nд = {state.params['nav_const_d']:.2f}\n"
+            f"ε = {state.params['eps_deg']:.2f}°\n"
+            f"ϑр = {state.params['theta_deg']:.2f}°\n"
+            f"qр = {state.params['q_deg']:.2f}°\n"
+            f"λ̇ = {lambda_dot_deg:.3f}°/с\n"
+            f"λ̈ = {lambda_ddot_deg:.3f}°/с²\n"
+            f"h = {state.params['miss_abs']:.2f} м\n"
+            f"Vсбл = {state.params['closing_speed']:.2f} м/с\n"
+            f"a_n = {state.params['normal_acc_real']:.2f} м/с²"
+        )
+        self.step_info.set(panel_text)
+        self.ax.text(
+            0.02, 0.02, panel_text,
+            transform=self.ax.transAxes,
+            ha="left", va="bottom", fontsize=10,
+            bbox=dict(boxstyle="round,pad=0.35", facecolor="white", edgecolor="0.35", alpha=0.9),
+            zorder=20,
+        )
+
     def _draw_step(self, step_idx):
         self._draw_base()
         if self.result is None:
@@ -793,10 +1045,17 @@ class MainWindow(tk.Frame):
         p = self.sampled_missile[step_idx]
         c = self.sampled_target[step_idx]
 
-        if self.result.method == "Прямой метод":
+        method = self.result.method
+        if method == "Прямой метод":
             self._draw_direct_step(state, step_idx, p, c)
-        elif self.result.method == "Параллельное сближение":
+        elif method == DIRECT_LEAD_METHOD:
+            self._draw_direct_lead_step(state, step_idx, p, c)
+        elif method == PURSUIT_METHOD:
+            self._draw_pursuit_step(state, step_idx, p, c)
+        elif method == "Параллельное сближение":
             self._draw_parallel_step(state, step_idx, p, c)
+        elif method == PD_METHOD:
+            self._draw_pd_step(state, step_idx, p, c)
         else:
             self._draw_proportional_step(state, step_idx, p, c)
 
