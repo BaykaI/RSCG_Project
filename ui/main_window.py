@@ -690,6 +690,14 @@ class MainWindow(tk.Frame):
             "  a_n max — максимум реализованной нормальной перегрузки."
         ))
 
+        self.plots_notebook = ttk.Notebook(right)
+        self.plots_notebook.grid(row=0, column=0, sticky="nsew")
+
+        trajectory_tab = ttk.Frame(self.plots_notebook)
+        trajectory_tab.rowconfigure(0, weight=1)
+        trajectory_tab.columnconfigure(0, weight=1)
+        self.plots_notebook.add(trajectory_tab, text="Траектория")
+
         self.fig = Figure(figsize=(10, 8), dpi=100)
         self.fig.subplots_adjust(left=0.045, right=0.988, bottom=0.075, top=0.945)
         self.ax = self.fig.add_subplot(111)
@@ -697,12 +705,26 @@ class MainWindow(tk.Frame):
         self.ax.set_xlabel("x, м")
         self.ax.set_ylabel("z, м")
         self.ax.grid(True, alpha=0.45)
-        self.canvas = FigureCanvasTkAgg(self.fig, master=right)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=trajectory_tab)
         self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
         self.canvas.mpl_connect("scroll_event", self._on_plot_scroll)
         self.canvas.mpl_connect("button_press_event", self._on_plot_button_press)
         self.canvas.mpl_connect("button_release_event", self._on_plot_button_release)
         self.canvas.mpl_connect("motion_notify_event", self._on_plot_motion)
+
+        profile_tab = ttk.Frame(self.plots_notebook)
+        profile_tab.rowconfigure(0, weight=1)
+        profile_tab.columnconfigure(0, weight=1)
+        self.plots_notebook.add(profile_tab, text="Перегрузка a_n(t) / промах h(t)")
+
+        self.profile_fig = Figure(figsize=(10, 8), dpi=100)
+        self.profile_fig.subplots_adjust(left=0.08, right=0.985, bottom=0.07, top=0.95, hspace=0.32)
+        self.profile_ax_acc = self.profile_fig.add_subplot(2, 1, 1)
+        self.profile_ax_miss = self.profile_fig.add_subplot(2, 1, 2, sharex=self.profile_ax_acc)
+        self._reset_profile_axes()
+        self.profile_canvas = FigureCanvasTkAgg(self.profile_fig, master=profile_tab)
+        self.profile_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+
         self._sync_method_controls()
 
     def _f(self, key):
@@ -1159,6 +1181,72 @@ class MainWindow(tk.Frame):
             self.ax.plot(h["missile"][:, 0], h["missile"][:, 1], color=h["color"], linestyle=h["style"], linewidth=1.2, alpha=0.9)
             self.ax.plot(h["target"][:, 0], h["target"][:, 1], color=h["color"], linestyle=h["style"], linewidth=1.0, alpha=0.7)
             self.ax.text(h["missile"][0, 0], h["missile"][0, 1], f"H{i}", color=h["color"], fontsize=8)
+
+    def _reset_profile_axes(self):
+        self.profile_ax_acc.clear()
+        self.profile_ax_acc.set_title("Нормальная перегрузка a_n(t)")
+        self.profile_ax_acc.set_ylabel("|a_n|, м/с²")
+        self.profile_ax_acc.grid(True, alpha=0.45)
+        self.profile_ax_miss.clear()
+        self.profile_ax_miss.set_title("Мгновенный промах h(t)")
+        self.profile_ax_miss.set_xlabel("t, с")
+        self.profile_ax_miss.set_ylabel("|h|, м")
+        self.profile_ax_miss.grid(True, alpha=0.45)
+
+    def _draw_profile_plots(self):
+        self._reset_profile_axes()
+        if self.result is None or not self.result.states:
+            self.profile_ax_acc.text(0.5, 0.5, "Нет данных", transform=self.profile_ax_acc.transAxes,
+                                     ha="center", va="center", color="#888", fontsize=11)
+            self.profile_ax_miss.text(0.5, 0.5, "Нет данных", transform=self.profile_ax_miss.transAxes,
+                                      ha="center", va="center", color="#888", fontsize=11)
+            self.profile_canvas.draw_idle()
+            return
+
+        times = np.array([s.time for s in self.result.states], dtype=float)
+        acc = np.array([abs(s.params.get("normal_acc_real", np.nan)) for s in self.result.states], dtype=float)
+        miss = np.array([abs(s.params.get("miss_abs", np.nan)) for s in self.result.states], dtype=float)
+
+        cur_time = None
+        if self.sampled_state_idx is not None and 0 <= self.current_step < len(self.sampled_state_idx):
+            cur_time = float(self.result.states[self.sampled_state_idx[self.current_step]].time)
+
+        ax = self.profile_ax_acc
+        if np.any(np.isfinite(acc)):
+            a_max = float(np.nanmax(acc))
+            a_max_idx = int(np.nanargmax(acc))
+            ax.plot(times, acc, color="#2ca02c", linewidth=1.6, label="|a_n|")
+            ax.axhline(a_max, color="#d62728", linestyle="--", linewidth=1.0,
+                       label=f"max |a_n| = {a_max:.2f} м/с² @ t = {times[a_max_idx]:.2f} с")
+            ax.scatter([times[a_max_idx]], [acc[a_max_idx]], color="#d62728", s=28, zorder=5)
+            if cur_time is not None:
+                ax.axvline(cur_time, color="#444", linewidth=0.9, alpha=0.6,
+                           label=f"текущий шаг (t = {cur_time:.2f} с)")
+            ax.legend(loc="best", fontsize=8)
+        else:
+            ax.text(0.5, 0.5, "Перегрузка не рассчитана для выбранного метода",
+                    transform=ax.transAxes, ha="center", va="center", color="#888", fontsize=10)
+
+        ax = self.profile_ax_miss
+        if np.any(np.isfinite(miss)):
+            h_min = float(np.nanmin(miss))
+            h_min_idx = int(np.nanargmin(miss))
+            h_max = float(np.nanmax(miss))
+            ax.plot(times, miss, color="#1f77b4", linewidth=1.6, label="|h|")
+            ax.axhline(h_min, color="#2ca02c", linestyle="--", linewidth=1.0,
+                       label=f"min |h| = {h_min:.2f} м @ t = {times[h_min_idx]:.2f} с")
+            ax.scatter([times[h_min_idx]], [miss[h_min_idx]], color="#2ca02c", s=28, zorder=5)
+            if cur_time is not None:
+                ax.axvline(cur_time, color="#444", linewidth=0.9, alpha=0.6,
+                           label=f"текущий шаг (t = {cur_time:.2f} с)")
+            if h_max > 0 and h_max / max(h_min, 1e-9) > 50:
+                ax.set_yscale("log")
+            ax.legend(loc="best", fontsize=8)
+        else:
+            ax.text(0.5, 0.5, "Нет данных о промахе", transform=ax.transAxes,
+                    ha="center", va="center", color="#888", fontsize=10)
+
+        self.profile_canvas.draw_idle()
 
     def _draw_base(self):
         self.ax.clear()
@@ -1724,6 +1812,7 @@ class MainWindow(tk.Frame):
             self._draw_proportional_step(state, step_idx, p, c)
 
         self.canvas.draw()
+        self._draw_profile_plots()
 
     def next_step(self):
         if self.result is None:
@@ -1767,6 +1856,7 @@ class MainWindow(tk.Frame):
         self.ax.set_xlabel("x, м")
         self.ax.set_ylabel("z, м")
         self.canvas.draw()
+        self._draw_profile_plots()
         self._update_nav_buttons()
         self.info.set("Очищено. Введите данные и постройте новую траекторию.")
         self.step_info.set("Нет данных")

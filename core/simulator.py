@@ -128,10 +128,12 @@ def simulate_direct_discrete(
         q = signed_angle_deg(los_dir, mdir)
         q_c = signed_angle_deg(los_dir, normalize(target_ground))
         miss = _miss_params(los, target_ground - missile_ground, missile_speed)
+        normal_acc_real = missile_speed * signed_angle_deg(mdir_prev, mdir) * np.pi / 180.0 / dt if dt > 1e-9 else 0.0
 
         _append_state(
             states, mp, missile_air, missile_ground, tp, target_ground, d, t,
-            dict(eps_deg=eps, theta_deg=theta, jc_deg=jc, q_deg=q, q_c_deg=q_c, delta=jc, **miss)
+            dict(eps_deg=eps, theta_deg=theta, jc_deg=jc, q_deg=q, q_c_deg=q_c, delta=jc,
+                 normal_acc_real=normal_acc_real, **miss)
         )
 
         if d <= hit_threshold:
@@ -216,10 +218,12 @@ def simulate_parallel_discrete(
 
         delta = q_p - np.rad2deg(np.arcsin(ratio))
         miss = _miss_params(los, target_ground - missile_ground, missile_speed)
+        normal_acc_real = missile_speed * signed_angle_deg(mdir_prev, mdir) * np.pi / 180.0 / dt if dt > 1e-9 else 0.0
 
         _append_state(
             states, mp, missile_air, missile_ground, tp, target_ground, d, t,
-            dict(eps_deg=eps, eps0_deg=eps0, q_p_deg=q_p, q_c_deg=q_c, delta=delta, theta_deg=theta, **miss)
+            dict(eps_deg=eps, eps0_deg=eps0, q_p_deg=q_p, q_c_deg=q_c, delta=delta, theta_deg=theta,
+                 normal_acc_real=normal_acc_real, **miss)
         )
 
         if d <= hit_threshold:
