@@ -260,6 +260,8 @@ class MainWindow(tk.Frame):
         self._last_pan_draw = 0.0
         self.history = []
         self._formula_cache: dict = {}
+        self.error_contour_enabled_var = tk.BooleanVar(value=False)
+        self.error_contour_button_text = tk.StringVar(value="Включить контур с ошибками")
         self._build_ui()
 
     def _build_ui(self):
@@ -516,22 +518,53 @@ class MainWindow(tk.Frame):
         err_container.grid(row=row, column=0, columnspan=2, sticky="ew")
         self._bind_help(err_header, "Параметры расчёта динамической и флюктуационной ошибок (Л8, С5). ЛКМ — свернуть/развернуть.")
         row += 1
-        entry("jc", "J_Ц, м/с²", "0",
-              "Нормальное (боковое) ускорение цели J_Ц. Используется в формуле "
-              "установившейся динамической ошибки пропорционального наведения "
-              "(С5.60): h_дин ≈ r · J_Ц / (V_сб · (N_0 − 2)).",
+        entry("jc", "x(t), ед", "0",
+              "Входной сигнал x(t), вызывающий динамическую составляющую промаха/ошибки. "
+              "По лекции динамическая ошибка считается как "
+              "h(t)=c0·x(t)+c1·x'(t)+1/2·c2·x''(t).",
               parent=err_body)
-        entry("gus1", "G_уш1(0), м²·с", "1e-4",
-              "Удельная односторонняя спектральная плотность углового шума ВН, "
-              "нормированная к единичному расстоянию: G_уш(0) = G_уш1(0)·r². "
-              "Используется в формуле флюктуационной ошибки (С5.75, упрощ.): "
-              "σ_h² = N_0 · G_уш1(0) / (4 · T_ук).",
+        entry("dyn_x1", "x'(t), ед/с", "0",
+              "Первая производная входного сигнала для аналитической оценки динамической ошибки по лекции: "
+              "h(t)=c0·x(t)+c1·x'(t)+1/2·c2·x''(t).",
               parent=err_body)
-        entry("tuk", "T_ук, с", "0.3",
-              "Постоянная времени контура (узла усиления). Согласно Л8/С5, для "
-              "инерционной ракеты при безынерционной ГСН T_ук ≈ 0.2…0.4 с. "
-              "Используется в формуле флюктуационной ошибки (С5.75).",
+        entry("dyn_x2", "x''(t), ед/с²", "0",
+              "Вторая производная входного сигнала для аналитической оценки динамической ошибки.",
               parent=err_body)
+        entry("dyn_c0", "c0", "1",
+              "Коэффициент c0 разложения передаточной функции Φij(p) по лекции.",
+              parent=err_body)
+        entry("dyn_c1", "c1", "0",
+              "Коэффициент c1 разложения передаточной функции Φij(p) по лекции.",
+              parent=err_body)
+        entry("dyn_c2", "c2", "0",
+              "Коэффициент c2 разложения передаточной функции Φij(p) по лекции.",
+              parent=err_body)
+        entry("gus1", "Gi0", "1e-4",
+              "Спектральная плотность мощности белого шума Gi(jω)=Gi0=const "
+              "для расчета флюктуационной дисперсии по лекции: D=Gi0·ΔFэф·Kmax².",
+              parent=err_body)
+        entry("fluct_kmax", "Kmax", "1",
+              "Kmax = |Φij(0)|, статический коэффициент передачи для расчета флюктуационной дисперсии "
+              "по лекции: D = Gi0·ΔFэф·Kmax².",
+              parent=err_body)
+        entry("fluct_df", "ΔFэф, Гц", "1",
+              "Эффективная шумовая полоса пропускания ΔFэф по лекции. "
+              "Если известен табличный интеграл In, можно задать ΔFэф = In/(2·Kmax²).",
+              parent=err_body)
+        err_btn_row = err_body.grid_size()[1]
+        self.error_contour_button = ttk.Button(
+            err_body,
+            textvariable=self.error_contour_button_text,
+            command=self.toggle_error_contour,
+        )
+        self.error_contour_button.grid(row=err_btn_row, column=0, columnspan=2, sticky="ew", pady=(6, 2))
+        self._bind_help(self.error_contour_button, (
+            "Одной кнопкой переключает идеальный контур на контур с динамической и "
+            "флюктуационной ошибками. В режиме с ошибками программа считает:\n"
+            "    h_дин = c0·x(t) + c1·x'(t) + 1/2·c2·x''(t),\n"
+            "    σ_h = sqrt(Gi0·ΔFэф·Kmax²),\n"
+            "    σ_общ = sqrt(h_дин² + σ_h²)."
+        ))
 
         ttk.Separator(left, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=6)
         row += 1
@@ -610,22 +643,20 @@ class MainWindow(tk.Frame):
         cb_miss.grid(row=row, column=0, columnspan=2, sticky="w")
         self._bind_help(cb_miss, "Показывать мгновенный промах h на каждом шаге траектории. Формула:\n    h = d² · λ̇ / V_р,\nгде d — текущая дистанция, λ̇ — угловая скорость ЛВ, V_р — скорость ракеты.")
         row += 1
-        self.show_h_dyn_var = tk.BooleanVar(value=True)
+        self.show_h_dyn_var = tk.BooleanVar(value=False)
         cb_h_dyn = ttk.Checkbutton(left, text="Показывать h_дин (динамическая)", variable=self.show_h_dyn_var, command=self._redraw_if_ready)
         cb_h_dyn.grid(row=row, column=0, columnspan=2, sticky="w")
         self._bind_help(cb_h_dyn, (
-            "Показывать установившуюся динамическую ошибку h_дин на каждом "
-            "шаге (С5.60):\n    h_дин ≈ r · J_Ц / (V_сб · (N_0 − 2)).\n"
-            "Считается только при N_0 > 2, V_сб > 0 и J_Ц > 0; иначе н/д."
+            "Показывать динамическую ошибку h_дин по лекции (формула 31):\n"
+            "    h_дин = c0·x(t) + c1·x'(t) + 1/2·c2·x''(t)."
         ))
         row += 1
-        self.show_h_fluct_var = tk.BooleanVar(value=True)
+        self.show_h_fluct_var = tk.BooleanVar(value=False)
         cb_h_fluct = ttk.Checkbutton(left, text="Показывать σ_h (флюктуационная)", variable=self.show_h_fluct_var, command=self._redraw_if_ready)
         cb_h_fluct.grid(row=row, column=0, columnspan=2, sticky="w")
         self._bind_help(cb_h_fluct, (
-            "Показывать СКО флюктуационной ошибки σ_h на каждом шаге "
-            "(С5.75, упрощ.):\n    σ_h = √(N_0 · G_уш1(0) / (4 · T_ук)).\n"
-            "Считается при T_ук > 0 и G_уш1(0) > 0; иначе н/д."
+            "Показывать СКО флюктуационной ошибки σ_h по лекции (формула 24):\n"
+            "    D = Gi0·ΔFэф·Kmax²,   σ_h = √D."
         ))
         row += 1
 
@@ -895,17 +926,18 @@ class MainWindow(tk.Frame):
     def _result_display_name(self):
         if self.result is None:
             return ""
+        suffix = " + ошибки" if self.error_contour_enabled_var.get() else ""
         if self.result.method == PROPORTIONAL_METHOD:
-            return f"{self.result.method}, N={self.navconst_var.get():.2f}"
+            return f"{self.result.method}, N={self.navconst_var.get():.2f}{suffix}"
         if self.result.method == PD_METHOD:
-            return f"{self.result.method}, Nп={self.navconst_var.get():.2f}, Nд={self.navconst_d_var.get():.2f}"
+            return f"{self.result.method}, Nп={self.navconst_var.get():.2f}, Nд={self.navconst_d_var.get():.2f}{suffix}"
         if self.result.method == DIRECT_LEAD_METHOD:
             try:
                 lead = float(self.lead_angle_var.get().replace(",", ".").strip())
             except ValueError:
                 lead = 0.0
-            return f"{self.result.method}, ψ={lead:.2f}°"
-        return self.result.method
+            return f"{self.result.method}, ψ={lead:.2f}°{suffix}"
+        return f"{self.result.method}{suffix}"
 
     def _compute_efficiency(self):
         if self.result is None or not self.result.states:
@@ -924,6 +956,11 @@ class MainWindow(tk.Frame):
         h_min = float(np.nanmin(finite_miss)) if finite_miss.size else None
         h_avg = float(np.nanmean(finite_miss)) if finite_miss.size else None
         a_max = float(np.nanmax(finite_acc)) if finite_acc.size else None
+        h_dyn_ca = None
+        sigma_h_ca = None
+        sigma_total_ca = None
+        if self.error_contour_enabled_var.get():
+            h_dyn_ca, sigma_h_ca, sigma_total_ca = self._compute_step_errors(self.result.states[min_distance_idx])
 
         if self.result.hit:
             rating = "высокая"
@@ -942,6 +979,9 @@ class MainWindow(tk.Frame):
             "h_min": h_min,
             "h_avg": h_avg,
             "a_max": a_max,
+            "h_dyn_ca": h_dyn_ca,
+            "sigma_h_ca": sigma_h_ca,
+            "sigma_total_ca": sigma_total_ca,
             "rating": rating,
             "outcome": outcome,
         }
@@ -949,6 +989,18 @@ class MainWindow(tk.Frame):
         a_line = "a_n max = нет данных" if a_max is None else f"a_n max = {a_max:.2f} м/с²"
         h_min_line = "h_min = нет данных" if h_min is None else f"h_min = {h_min:.2f} м"
         h_avg_line = "h_avg = нет данных" if h_avg is None else f"h_avg = {h_avg:.2f} м"
+        if self.error_contour_enabled_var.get():
+            h_dyn_line = "h_дин(R_min) = н/д" if h_dyn_ca is None else f"h_дин(R_min) = {h_dyn_ca:.2f} м"
+            sigma_h_line = "σ_h = н/д" if sigma_h_ca is None else f"σ_h = {sigma_h_ca:.2f} м"
+            sigma_total_line = "σ_общ(R_min) = н/д" if sigma_total_ca is None else f"σ_общ(R_min) = {sigma_total_ca:.2f} м"
+            contour_lines = (
+                "\nКонтур: с динамической и флюктуационной ошибками"
+                f"\n{h_dyn_line}"
+                f"\n{sigma_h_line}"
+                f"\n{sigma_total_line}"
+            )
+        else:
+            contour_lines = "\nКонтур: идеальный"
         self.efficiency_info.set(
             f"Эффективность: {rating}\n"
             f"Итог: {outcome}\n"
@@ -956,6 +1008,7 @@ class MainWindow(tk.Frame):
             f"{h_min_line}\n"
             f"{h_avg_line}\n"
             f"{a_line}"
+            f"{contour_lines}"
         )
 
     def _redraw_if_ready(self):
@@ -1302,54 +1355,69 @@ class MainWindow(tk.Frame):
         except ValueError:
             return float(default)
 
+    def toggle_error_contour(self):
+        enabled = not self.error_contour_enabled_var.get()
+        self.error_contour_enabled_var.set(enabled)
+        if enabled:
+            self.error_contour_button_text.set("Вернуть идеальный контур")
+            self.show_h_dyn_var.set(True)
+            self.show_h_fluct_var.set(True)
+        else:
+            self.error_contour_button_text.set("Включить контур с ошибками")
+            self.show_h_dyn_var.set(False)
+            self.show_h_fluct_var.set(False)
+        self._compute_efficiency()
+        self._redraw_if_ready()
+
     def _compute_step_errors(self, state):
-        """Compute steady-state dynamic miss (С5.60) and fluctuation σ_h (С5.75, упрощ.).
+        """Compute dynamic and fluctuation errors by lecture formulas."""
+        if not self.error_contour_enabled_var.get():
+            return None, None, None
 
-        Returns (h_dyn, sigma_h); either may be None if formula is not applicable
-        (N_0 ≤ 2, V_сб ≤ 0, J_Ц ≤ 0, T_ук ≤ 0, G_уш1(0) ≤ 0).
-        """
-        jc = self._read_float("jc", 0.0)
-        gus1 = self._read_float("gus1", 0.0)
-        tuk = self._read_float("tuk", 0.0)
-        n0 = float(self.navconst_var.get())
+        x0 = self._read_float("jc", 0.0)
+        x1 = self._read_float("dyn_x1", 0.0)
+        x2 = self._read_float("dyn_x2", 0.0)
+        c0 = self._read_float("dyn_c0", 0.0)
+        c1 = self._read_float("dyn_c1", 0.0)
+        c2 = self._read_float("dyn_c2", 0.0)
+        h_dyn = c0 * x0 + c1 * x1 + 0.5 * c2 * x2
 
-        r = float(state.distance)
-        v_close = float(state.params.get("closing_speed", 0.0))
-        if v_close <= 1e-9:
-            rel = state.target_ground_vel - state.missile_ground_vel
-            d = norm(state.target_pos - state.missile_pos)
-            if d > 1e-9:
-                los_unit = (state.target_pos - state.missile_pos) / d
-                v_close = -float(np.dot(los_unit, rel))
+        gi0 = self._read_float("gus1", 0.0)
+        delta_f_eff = self._read_float("fluct_df", 0.0)
+        kmax = self._read_float("fluct_kmax", 0.0)
+        d_fluct = gi0 * delta_f_eff * kmax * kmax
+        sigma_h = float(np.sqrt(d_fluct)) if d_fluct >= 0.0 else None
 
-        h_dyn = None
-        if n0 > 2.0 + 1e-9 and v_close > 1e-9 and jc > 0.0:
-            h_dyn = r * jc / (v_close * (n0 - 2.0))
+        sigma_total = None
+        if sigma_h is not None:
+            sigma_total = float(np.sqrt(h_dyn * h_dyn + sigma_h * sigma_h))
 
-        sigma_h = None
-        if tuk > 1e-9 and gus1 > 0.0 and n0 > 0.0:
-            sigma_h = float(np.sqrt(n0 * gus1 / (4.0 * tuk)))
-
-        return h_dyn, sigma_h
+        return h_dyn, sigma_h, sigma_total
 
     def _format_step_errors(self, state):
         """Return text block with h_дин / σ_h lines according to current checkboxes."""
         lines = []
+        if not self.error_contour_enabled_var.get():
+            return ""
         show_dyn = getattr(self, "show_h_dyn_var", None)
         show_fluct = getattr(self, "show_h_fluct_var", None)
         if (show_dyn is None or not show_dyn.get()) and (show_fluct is None or not show_fluct.get()):
             return ""
-        h_dyn, sigma_h = self._compute_step_errors(state)
+        h_dyn, sigma_h, sigma_total = self._compute_step_errors(state)
         if show_dyn is not None and show_dyn.get():
             if h_dyn is None:
-                lines.append("h_дин = н/д (требуется N_0>2, V_сб>0, J_Ц>0)")
+                lines.append("h_дин = н/д")
             else:
-                lines.append(f"h_дин = {h_dyn:.2f} м  (С5.60)")
+                lines.append(f"h_дин = {h_dyn:.2f} м  (Л8, ф.31)")
         if show_fluct is not None and show_fluct.get():
             if sigma_h is None:
-                lines.append("σ_h = н/д (требуется T_ук>0, G_уш1(0)>0)")
+                lines.append("σ_h = н/д (проверьте Gi0, ΔFэф, Kmax)")
             else:
-                lines.append(f"σ_h = {sigma_h:.2f} м  (С5.75)")
+                lines.append(f"σ_h = {sigma_h:.2f} м  (Л8, ф.24)")
+        if sigma_total is None:
+            lines.append("σ_общ = н/д")
+        else:
+            lines.append(f"σ_общ = {sigma_total:.2f} м  (sqrt(h_дин² + σ_h²))")
         return "\n".join(lines)
 
     def _draw_direct_step(self, state, step_idx, p, c):
