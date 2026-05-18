@@ -512,6 +512,30 @@ class MainWindow(tk.Frame):
         ttk.Separator(left, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=6)
         row += 1
 
+        err_container, err_body, err_header = self._make_collapsible(left, "Параметры анализа точности")
+        err_container.grid(row=row, column=0, columnspan=2, sticky="ew")
+        self._bind_help(err_header, "Параметры расчёта динамической и флюктуационной ошибок (Л8, С5). ЛКМ — свернуть/развернуть.")
+        row += 1
+        entry("jc", "J_Ц, м/с²", "0",
+              "Нормальное (боковое) ускорение цели J_Ц. Используется в формуле "
+              "установившейся динамической ошибки пропорционального наведения "
+              "(С5.60): h_дин ≈ r · J_Ц / (V_сб · (N_0 − 2)).",
+              parent=err_body)
+        entry("gus1", "G_уш1(0), м²·с", "1e-4",
+              "Удельная односторонняя спектральная плотность углового шума ВН, "
+              "нормированная к единичному расстоянию: G_уш(0) = G_уш1(0)·r². "
+              "Используется в формуле флюктуационной ошибки (С5.75, упрощ.): "
+              "σ_h² = N_0 · G_уш1(0) / (4 · T_ук).",
+              parent=err_body)
+        entry("tuk", "T_ук, с", "0.3",
+              "Постоянная времени контура (узла усиления). Согласно Л8/С5, для "
+              "инерционной ракеты при безынерционной ГСН T_ук ≈ 0.2…0.4 с. "
+              "Используется в формуле флюктуационной ошибки (С5.75).",
+              parent=err_body)
+
+        ttk.Separator(left, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=6)
+        row += 1
+
         ttk.Label(left, text="Память траекторий").grid(row=row, column=0, columnspan=2, sticky="w")
         row += 1
 
@@ -585,6 +609,24 @@ class MainWindow(tk.Frame):
         cb_miss = ttk.Checkbutton(left, text="Показывать промах h", variable=self.show_miss_var, command=self._redraw_if_ready)
         cb_miss.grid(row=row, column=0, columnspan=2, sticky="w")
         self._bind_help(cb_miss, "Показывать мгновенный промах h на каждом шаге траектории. Формула:\n    h = d² · λ̇ / V_р,\nгде d — текущая дистанция, λ̇ — угловая скорость ЛВ, V_р — скорость ракеты.")
+        row += 1
+        self.show_h_dyn_var = tk.BooleanVar(value=True)
+        cb_h_dyn = ttk.Checkbutton(left, text="Показывать h_дин (динамическая)", variable=self.show_h_dyn_var, command=self._redraw_if_ready)
+        cb_h_dyn.grid(row=row, column=0, columnspan=2, sticky="w")
+        self._bind_help(cb_h_dyn, (
+            "Показывать установившуюся динамическую ошибку h_дин на каждом "
+            "шаге (С5.60):\n    h_дин ≈ r · J_Ц / (V_сб · (N_0 − 2)).\n"
+            "Считается только при N_0 > 2, V_сб > 0 и J_Ц > 0; иначе н/д."
+        ))
+        row += 1
+        self.show_h_fluct_var = tk.BooleanVar(value=True)
+        cb_h_fluct = ttk.Checkbutton(left, text="Показывать σ_h (флюктуационная)", variable=self.show_h_fluct_var, command=self._redraw_if_ready)
+        cb_h_fluct.grid(row=row, column=0, columnspan=2, sticky="w")
+        self._bind_help(cb_h_fluct, (
+            "Показывать СКО флюктуационной ошибки σ_h на каждом шаге "
+            "(С5.75, упрощ.):\n    σ_h = √(N_0 · G_уш1(0) / (4 · T_ук)).\n"
+            "Считается при T_ук > 0 и G_уш1(0) > 0; иначе н/д."
+        ))
         row += 1
 
         btns = ttk.Frame(left)
@@ -1248,6 +1290,68 @@ class MainWindow(tk.Frame):
         ty = center[1] + tr * np.sin(np.deg2rad(mid)) + text_shift[1]
         self.ax.text(tx, ty, label, color=color, fontsize=fontsize, fontweight="bold", zorder=10)
 
+    def _read_float(self, key, default=0.0):
+        var = self.vars.get(key)
+        if var is None:
+            return float(default)
+        text = str(var.get()).replace(",", ".").strip()
+        if not text:
+            return float(default)
+        try:
+            return float(text)
+        except ValueError:
+            return float(default)
+
+    def _compute_step_errors(self, state):
+        """Compute steady-state dynamic miss (С5.60) and fluctuation σ_h (С5.75, упрощ.).
+
+        Returns (h_dyn, sigma_h); either may be None if formula is not applicable
+        (N_0 ≤ 2, V_сб ≤ 0, J_Ц ≤ 0, T_ук ≤ 0, G_уш1(0) ≤ 0).
+        """
+        jc = self._read_float("jc", 0.0)
+        gus1 = self._read_float("gus1", 0.0)
+        tuk = self._read_float("tuk", 0.0)
+        n0 = float(self.navconst_var.get())
+
+        r = float(state.distance)
+        v_close = float(state.params.get("closing_speed", 0.0))
+        if v_close <= 1e-9:
+            rel = state.target_ground_vel - state.missile_ground_vel
+            d = norm(state.target_pos - state.missile_pos)
+            if d > 1e-9:
+                los_unit = (state.target_pos - state.missile_pos) / d
+                v_close = -float(np.dot(los_unit, rel))
+
+        h_dyn = None
+        if n0 > 2.0 + 1e-9 and v_close > 1e-9 and jc > 0.0:
+            h_dyn = r * jc / (v_close * (n0 - 2.0))
+
+        sigma_h = None
+        if tuk > 1e-9 and gus1 > 0.0 and n0 > 0.0:
+            sigma_h = float(np.sqrt(n0 * gus1 / (4.0 * tuk)))
+
+        return h_dyn, sigma_h
+
+    def _format_step_errors(self, state):
+        """Return text block with h_дин / σ_h lines according to current checkboxes."""
+        lines = []
+        show_dyn = getattr(self, "show_h_dyn_var", None)
+        show_fluct = getattr(self, "show_h_fluct_var", None)
+        if (show_dyn is None or not show_dyn.get()) and (show_fluct is None or not show_fluct.get()):
+            return ""
+        h_dyn, sigma_h = self._compute_step_errors(state)
+        if show_dyn is not None and show_dyn.get():
+            if h_dyn is None:
+                lines.append("h_дин = н/д (требуется N_0>2, V_сб>0, J_Ц>0)")
+            else:
+                lines.append(f"h_дин = {h_dyn:.2f} м  (С5.60)")
+        if show_fluct is not None and show_fluct.get():
+            if sigma_h is None:
+                lines.append("σ_h = н/д (требуется T_ук>0, G_уш1(0)>0)")
+            else:
+                lines.append(f"σ_h = {sigma_h:.2f} м  (С5.75)")
+        return "\n".join(lines)
+
     def _draw_direct_step(self, state, step_idx, p, c):
         los = c - p
         los_dir = normalize(los)
@@ -1289,6 +1393,9 @@ class MainWindow(tk.Frame):
             f"h = {state.params['miss_abs']:.2f} м\n"
             f"Δ = {delta:.2f}°"
         )
+        err_text = self._format_step_errors(state)
+        if err_text:
+            panel_text = panel_text + "\n" + err_text
         self.step_info.set(panel_text)
         self.ax.text(
             0.02, 0.02, panel_text,
@@ -1344,6 +1451,9 @@ class MainWindow(tk.Frame):
             f"h = {state.params['miss_abs']:.2f} м\n"
             f"Δ = {state.params['delta']:.2f}°"
         )
+        err_text = self._format_step_errors(state)
+        if err_text:
+            panel_text = panel_text + "\n" + err_text
         self.step_info.set(panel_text)
         self.ax.text(
             0.02, 0.02, panel_text,
@@ -1399,6 +1509,9 @@ class MainWindow(tk.Frame):
             f"Vсбл = {state.params['closing_speed']:.2f} м/с\n"
             f"a_n = {state.params['normal_acc_real']:.2f} м/с²"
         )
+        err_text = self._format_step_errors(state)
+        if err_text:
+            panel_text = panel_text + "\n" + err_text
         self.step_info.set(panel_text)
         self.ax.text(
             0.02, 0.02, panel_text,
@@ -1452,6 +1565,9 @@ class MainWindow(tk.Frame):
             f"h = {state.params['miss_abs']:.2f} м\n"
             f"Δ = {delta:.2f}°"
         )
+        err_text = self._format_step_errors(state)
+        if err_text:
+            panel_text = panel_text + "\n" + err_text
         self.step_info.set(panel_text)
         self.ax.text(
             0.02, 0.02, panel_text,
@@ -1509,6 +1625,9 @@ class MainWindow(tk.Frame):
             f"h = {state.params['miss_abs']:.2f} м\n"
             f"Δ = γ − ε = {delta:.2f}°"
         )
+        err_text = self._format_step_errors(state)
+        if err_text:
+            panel_text = panel_text + "\n" + err_text
         self.step_info.set(panel_text)
         self.ax.text(
             0.02, 0.02, panel_text,
@@ -1567,6 +1686,9 @@ class MainWindow(tk.Frame):
             f"Vсбл = {state.params['closing_speed']:.2f} м/с\n"
             f"a_n = {state.params['normal_acc_real']:.2f} м/с²"
         )
+        err_text = self._format_step_errors(state)
+        if err_text:
+            panel_text = panel_text + "\n" + err_text
         self.step_info.set(panel_text)
         self.ax.text(
             0.02, 0.02, panel_text,
