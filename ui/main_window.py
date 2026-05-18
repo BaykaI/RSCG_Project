@@ -42,6 +42,47 @@ STYLE_MAP = {
 }
 MAX_STEP_LABELS = 60
 
+METHOD_DESCRIPTIONS = {
+    "Прямой метод": (
+        "Курс ОУ всегда направлен на текущее положение цели (вдоль ЛВ):\n"
+        "    desired_dir = (r_ц − r_р) / |r_ц − r_р|.\n"
+        "Ракета доворачивает к цели каждый шаг. При ветре путевая скорость "
+        "отклоняется от ЛВ — траектория сносится."
+    ),
+    DIRECT_LEAD_METHOD: (
+        "То же, что прямой метод, но курс смещён на постоянный угол упреждения ψ "
+        "от линии визирования:\n"
+        "    ϑ = ε + ψ,    desired_dir = R(ψ) · e_ЛВ.\n"
+        "ψ задаётся вручную."
+    ),
+    PURSUIT_METHOD: (
+        "Вдоль ЛВ выставляется путевая скорость ОУ (V_возд + W), а не курс. "
+        "Курс «крабится», компенсируя снос ветра: ищется k > 0 такое, что\n"
+        "    |k · e_ЛВ − W| = V_р,\n"
+        "и курс = (k · e_ЛВ − W) / V_р. При W = 0 совпадает с прямым методом."
+    ),
+    "Параллельное сближение": (
+        "ЛВ сохраняет начальное направление ε₀ (не вращается). Из закона синусов:\n"
+        "    q_р = arcsin((V_ц / V_р) · sin(q_ц)),\n"
+        "    ϑ = ε₀ + q_р.\n"
+        "Идеальная встреча — при сохранении угла визирования."
+    ),
+    PROPORTIONAL_METHOD: (
+        "Командное ускорение пропорционально скорости вращения ЛВ:\n"
+        "    a_n_cmd = N · V_сбл · λ̇.\n"
+        "N (3…20) — навигационная константа. Применяется в большинстве "
+        "современных самонаводящихся ракет. При N → ∞ метод сходится к "
+        "параллельному сближению."
+    ),
+    PD_METHOD: (
+        "Расширение пропорционального наведения дифференциальной составляющей:\n"
+        "    a_n_cmd = V_сбл · (Nп · λ̇ + Nд · λ̈),\n"
+        "    λ̈ ≈ (λ̇_t − λ̇_{t−dt}) / dt.\n"
+        "Дифференциальная часть упреждает ускорение цели и уменьшает промах "
+        "при манёврах."
+    ),
+}
+
 class MainWindow(tk.Frame):
     def __init__(self, master):
         super().__init__(master)
@@ -73,17 +114,31 @@ class MainWindow(tk.Frame):
 
         row = 0
 
-        def entry(key, label, value):
+        def entry(key, label, value, help_text="", parent=None):
             nonlocal row
-            ttk.Label(left, text=label).grid(row=row, column=0, sticky="w", pady=2)
+            target = parent if parent is not None else left
+            if parent is None:
+                r = row
+                row += 1
+            else:
+                r = target.grid_size()[1]
+            lbl = ttk.Label(target, text=label)
+            lbl.grid(row=r, column=0, sticky="w", pady=2)
             self.vars[key] = tk.StringVar(value=value)
-            ttk.Entry(left, textvariable=self.vars[key], width=18).grid(row=row, column=1, sticky="ew", pady=2)
-            row += 1
+            ent = ttk.Entry(target, textvariable=self.vars[key], width=18)
+            ent.grid(row=r, column=1, sticky="ew", pady=2)
+            if help_text:
+                self._bind_help(lbl, help_text)
+                self._bind_help(ent, help_text)
 
         ttk.Label(left, text="Методы наведения", font=("TkDefaultFont", 11, "bold")).grid(row=row, column=0, columnspan=2, sticky="w")
         row += 1
 
-        ttk.Label(left, text="Метод").grid(row=row, column=0, sticky="w", pady=2)
+        ttk.Label(left, text="Подсказка: ПКМ по любому элементу — описание", foreground="#666", font=("TkDefaultFont", 8, "italic")).grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        row += 1
+
+        method_label = ttk.Label(left, text="Метод")
+        method_label.grid(row=row, column=0, sticky="w", pady=2)
         self.method_var = tk.StringVar(value="Прямой метод")
         self.method_combo = ttk.Combobox(
             left,
@@ -100,44 +155,104 @@ class MainWindow(tk.Frame):
         )
         self.method_combo.grid(row=row, column=1, sticky="ew", pady=2)
         self.method_combo.bind("<<ComboboxSelected>>", lambda event: self._sync_method_controls())
+        method_combo_help = (
+            "Выбор закона наведения. Влияет на формулу расчёта требуемого курса "
+            "ракеты на каждом шаге. Краткое описание текущего метода — в рамке "
+            "ниже."
+        )
+        self._bind_help(method_label, method_combo_help)
+        self._bind_help(self.method_combo, method_combo_help)
+        row += 1
+
+        desc_container, desc_body, desc_header = self._make_collapsible(left, "Описание метода")
+        desc_container.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(2, 6))
+        self._bind_help(desc_header, "Краткое описание выбранного метода с ключевой формулой. ЛКМ по заголовку — свернуть/развернуть.")
+        self.method_description_var = tk.StringVar(value=METHOD_DESCRIPTIONS["Прямой метод"])
+        self.method_description_label = ttk.Label(
+            desc_body,
+            textvariable=self.method_description_var,
+            justify="left",
+            wraplength=400,
+            relief="solid",
+            padding=8,
+            foreground="#333",
+        )
+        self.method_description_label.grid(row=0, column=0, sticky="ew")
+        self._bind_help(self.method_description_label, "Краткое описание выбранного метода: основная идея и ключевая формула.")
         row += 1
 
         ttk.Separator(left, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=6)
         row += 1
 
-        ttk.Label(left, text="ОУ").grid(row=row, column=0, columnspan=2, sticky="w")
+        mu_container, mu_body, mu_header = self._make_collapsible(left, "ОУ — объект управления (ракета)")
+        mu_container.grid(row=row, column=0, columnspan=2, sticky="ew")
+        self._bind_help(mu_header, "Блок начальных параметров ракеты (объекта управления). ЛКМ по заголовку — свернуть/развернуть.")
         row += 1
-        entry("mx", "x ОУ, м", "12000")
-        entry("mz", "z ОУ, м", "-8000")
-        entry("mspeed", "V ОУ, м/с", "450")
-        entry("mcourse", "курс ОУ, град", "120")
-        entry("man", "a_n max, м/с²", "80")
+        entry("mx", "x ОУ, м", "12000",
+              "Начальная координата X ракеты (объекта управления) в метрах. Задаёт стартовую точку дискретной траектории ОУ.",
+              parent=mu_body)
+        entry("mz", "z ОУ, м", "-8000",
+              "Начальная координата Z ракеты (ОУ) в метрах. Задаёт стартовую точку траектории.",
+              parent=mu_body)
+        entry("mspeed", "V ОУ, м/с", "450",
+              "Модуль воздушной скорости ракеты V_р, м/с. Из него формируется вектор курса: V_возд = V_р · e_курс. Путевая скорость: V_пут = V_возд + W.",
+              parent=mu_body)
+        entry("mcourse", "курс ОУ, град", "120",
+              "Начальный курс ракеты — угол вектора V_возд от оси OX, град. Используется на первом шаге; далее курс пересчитывается законом наведения.",
+              parent=mu_body)
+        entry("man", "a_n max, м/с²", "80",
+              "Максимальная нормальная перегрузка ракеты a_n_max, м/с². Ограничивает скорость разворота: |Δϑ| / dt ≤ a_n_max / V_р. Если требуемый поворот превышает лимит — обрезается.",
+              parent=mu_body)
 
         ttk.Separator(left, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=6)
         row += 1
 
-        ttk.Label(left, text="ОС").grid(row=row, column=0, columnspan=2, sticky="w")
+        os_container, os_body, os_header = self._make_collapsible(left, "ОС — объект сопровождения (цель)")
+        os_container.grid(row=row, column=0, columnspan=2, sticky="ew")
+        self._bind_help(os_header, "Блок начальных параметров цели (объекта сопровождения). ЛКМ по заголовку — свернуть/развернуть.")
         row += 1
-        entry("tx", "x ОС, м", "0")
-        entry("tz", "z ОС, м", "0")
-        entry("tspeed", "V ОС, м/с", "120")
-        entry("tcourse", "курс ОС, град", "0")
+        entry("tx", "x ОС, м", "0",
+              "Начальная координата X цели (объекта сопровождения), м.",
+              parent=os_body)
+        entry("tz", "z ОС, м", "0",
+              "Начальная координата Z цели (ОС), м.",
+              parent=os_body)
+        entry("tspeed", "V ОС, м/с", "120",
+              "Модуль воздушной скорости цели V_ц, м/с.",
+              parent=os_body)
+        entry("tcourse", "курс ОС, град", "0",
+              "Курс цели (угол вектора скорости от оси OX), град. Цель движется равномерно прямолинейно (в текущей модели — без манёвров).",
+              parent=os_body)
 
         ttk.Separator(left, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=6)
         row += 1
 
-        ttk.Label(left, text="Параметры расчета").grid(row=row, column=0, columnspan=2, sticky="w")
+        params_container, params_body, params_header = self._make_collapsible(left, "Параметры расчета")
+        params_container.grid(row=row, column=0, columnspan=2, sticky="ew")
+        self._bind_help(params_header, "Численные параметры моделирования (ветер, dt, t_max, R_контакта) и коэффициенты выбранного метода. ЛКМ по заголовку — свернуть/развернуть.")
         row += 1
-        entry("windx", "ветер x, м/с", "0")
-        entry("windz", "ветер z, м/с", "0")
-        entry("dt", "dt моделирования, с", "5")
-        entry("tmax", "t_max, с", "120")
-        entry("hit", "радиус условного контакта, м", "25")
 
-        self.navconst_label = ttk.Label(left, text="N наведения")
-        self.navconst_label.grid(row=row, column=0, sticky="w", pady=2)
-        self.navconst_frame = ttk.Frame(left)
-        self.navconst_frame.grid(row=row, column=1, sticky="ew", pady=2)
+        entry("windx", "ветер x, м/с", "0",
+              "Компонента вектора ветра W по X, м/с. Прибавляется к воздушной скорости: V_пут = V_возд + W. Именно ветер делает поведение метода погони отличным от прямого метода.",
+              parent=params_body)
+        entry("windz", "ветер z, м/с", "0",
+              "Компонента вектора ветра W по Z, м/с.",
+              parent=params_body)
+        entry("dt", "dt моделирования, с", "5",
+              "Шаг дискретного моделирования, с. Уменьшение dt повышает точность интегрирования кинематики и плотность точек траектории, но увеличивает время счёта.",
+              parent=params_body)
+        entry("tmax", "t_max, с", "120",
+              "Максимальное модельное время симуляции, с. Симуляция останавливается по достижении t_max, условного контакта или начала расхождения.",
+              parent=params_body)
+        entry("hit", "радиус условного контакта, м", "25",
+              "Радиус условного контакта R_к, м. При d ≤ R_к фиксируется попадание (hit=True).",
+              parent=params_body)
+
+        nr = params_body.grid_size()[1]
+        self.navconst_label = ttk.Label(params_body, text="N наведения")
+        self.navconst_label.grid(row=nr, column=0, sticky="w", pady=2)
+        self.navconst_frame = ttk.Frame(params_body)
+        self.navconst_frame.grid(row=nr, column=1, sticky="ew", pady=2)
         self.navconst_frame.columnconfigure(0, weight=1)
         self.navconst_var = tk.DoubleVar(value=3.0)
         self.navconst_label_var = tk.StringVar(value="3.00")
@@ -145,27 +260,45 @@ class MainWindow(tk.Frame):
         def update_navconst_label(value):
             self.navconst_label_var.set(f"{float(value):.2f}")
 
-        ttk.Scale(
+        navconst_scale = ttk.Scale(
             self.navconst_frame,
             from_=3.0,
             to=20.0,
             variable=self.navconst_var,
             command=update_navconst_label,
-        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        )
+        navconst_scale.grid(row=0, column=0, sticky="ew", padx=(0, 6))
         ttk.Label(self.navconst_frame, textvariable=self.navconst_label_var, width=5).grid(row=0, column=1, sticky="e")
-        row += 1
+        navconst_help = (
+            "Навигационная константа N (для пропорционального и ПД методов).\n"
+            "Формула пропорционального метода:\n"
+            "    a_n_cmd = N · V_сбл · λ̇.\n"
+            "Чем больше N, тем агрессивнее реакция на скорость вращения ЛВ. "
+            "Типичный диапазон 3…5; при N → ∞ метод сходится к параллельному "
+            "сближению. В ПД методе это коэффициент Nп."
+        )
+        self._bind_help(self.navconst_label, navconst_help)
+        self._bind_help(navconst_scale, navconst_help)
 
-        self.lead_angle_label = ttk.Label(left, text="ψ упреждения, град")
-        self.lead_angle_label.grid(row=row, column=0, sticky="w", pady=2)
+        lr = params_body.grid_size()[1]
+        self.lead_angle_label = ttk.Label(params_body, text="ψ упреждения, град")
+        self.lead_angle_label.grid(row=lr, column=0, sticky="w", pady=2)
         self.lead_angle_var = tk.StringVar(value="10")
-        self.lead_angle_entry = ttk.Entry(left, textvariable=self.lead_angle_var, width=18)
-        self.lead_angle_entry.grid(row=row, column=1, sticky="ew", pady=2)
-        row += 1
+        self.lead_angle_entry = ttk.Entry(params_body, textvariable=self.lead_angle_var, width=18)
+        self.lead_angle_entry.grid(row=lr, column=1, sticky="ew", pady=2)
+        lead_help = (
+            "Постоянный угол упреждения ψ, град. Применяется только в методе "
+            "«Прямой с постоянным углом упреждения». Курс задаётся как "
+            "ϑ = ε + ψ, где ε — угол ЛВ. При ψ = 0 совпадает с прямым методом."
+        )
+        self._bind_help(self.lead_angle_label, lead_help)
+        self._bind_help(self.lead_angle_entry, lead_help)
 
-        self.navconst_d_label = ttk.Label(left, text="Nд (дифф.)")
-        self.navconst_d_label.grid(row=row, column=0, sticky="w", pady=2)
-        self.navconst_d_frame = ttk.Frame(left)
-        self.navconst_d_frame.grid(row=row, column=1, sticky="ew", pady=2)
+        dr = params_body.grid_size()[1]
+        self.navconst_d_label = ttk.Label(params_body, text="Nд (дифф.)")
+        self.navconst_d_label.grid(row=dr, column=0, sticky="w", pady=2)
+        self.navconst_d_frame = ttk.Frame(params_body)
+        self.navconst_d_frame.grid(row=dr, column=1, sticky="ew", pady=2)
         self.navconst_d_frame.columnconfigure(0, weight=1)
         self.navconst_d_var = tk.DoubleVar(value=0.5)
         self.navconst_d_label_var = tk.StringVar(value="0.50")
@@ -173,15 +306,25 @@ class MainWindow(tk.Frame):
         def update_navconst_d_label(value):
             self.navconst_d_label_var.set(f"{float(value):.2f}")
 
-        ttk.Scale(
+        navconst_d_scale = ttk.Scale(
             self.navconst_d_frame,
             from_=0.0,
             to=5.0,
             variable=self.navconst_d_var,
             command=update_navconst_d_label,
-        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        )
+        navconst_d_scale.grid(row=0, column=0, sticky="ew", padx=(0, 6))
         ttk.Label(self.navconst_d_frame, textvariable=self.navconst_d_label_var, width=5).grid(row=0, column=1, sticky="e")
-        row += 1
+        navconst_d_help = (
+            "Дифференциальный коэффициент Nд для пропорционально-"
+            "дифференциального метода.\n"
+            "Формула: a_n_cmd = V_сбл · (Nп · λ̇ + Nд · λ̈),\n"
+            "где λ̈ ≈ (λ̇_t − λ̇_{t−dt}) / dt — численная оценка углового "
+            "ускорения ЛВ. Дифференциальная часть упреждает ускорение цели "
+            "и уменьшает промах при манёврах."
+        )
+        self._bind_help(self.navconst_d_label, navconst_d_help)
+        self._bind_help(navconst_d_scale, navconst_d_help)
 
         ttk.Separator(left, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=6)
         row += 1
@@ -190,11 +333,15 @@ class MainWindow(tk.Frame):
         row += 1
 
         self.save_history_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(left, text="Сохранять предыдущую траекторию", variable=self.save_history_var).grid(row=row, column=0, columnspan=2, sticky="w")
+        save_history_cb = ttk.Checkbutton(left, text="Сохранять предыдущую траекторию", variable=self.save_history_var)
+        save_history_cb.grid(row=row, column=0, columnspan=2, sticky="w")
+        self._bind_help(save_history_cb, "При включении после каждого «Построить» текущая траектория добавляется в список сохранённых для сравнения с новыми расчётами.")
         row += 1
 
         self.show_history_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(left, text="Показывать сохраненные траектории", variable=self.show_history_var, command=self._redraw_if_ready).grid(row=row, column=0, columnspan=2, sticky="w")
+        show_history_cb = ttk.Checkbutton(left, text="Показывать сохраненные траектории", variable=self.show_history_var, command=self._redraw_if_ready)
+        show_history_cb.grid(row=row, column=0, columnspan=2, sticky="w")
+        self._bind_help(show_history_cb, "Показывать сохранённые ранее траектории на графике поверх текущей. Не влияет на сам список — только на отрисовку.")
         row += 1
 
         ttk.Label(left, text="Сохраненные траектории").grid(row=row, column=0, columnspan=2, sticky="w")
@@ -202,24 +349,39 @@ class MainWindow(tk.Frame):
         self.history_listbox = tk.Listbox(left, selectmode=tk.EXTENDED, height=6, exportselection=False)
         self.history_listbox.grid(row=row, column=0, columnspan=2, sticky="ew", pady=2)
         self.history_listbox.bind("<<ListboxSelect>>", lambda event: self._redraw_if_ready())
+        self._bind_help(self.history_listbox, "Список сохранённых траекторий. Выбор подмножества фильтрует, какие из них рисовать (если ни одна не выбрана — рисуются все).")
         row += 1
 
         history_btns = ttk.Frame(left)
         history_btns.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(2, 4))
         history_btns.columnconfigure(0, weight=1)
         history_btns.columnconfigure(1, weight=1)
-        ttk.Button(history_btns, text="Удалить выбранные", command=self.delete_selected_history).grid(row=0, column=0, sticky="ew", padx=(0, 2))
-        ttk.Button(history_btns, text="Удалить все", command=self.clear_history).grid(row=0, column=1, sticky="ew", padx=(2, 0))
+        btn_del_sel = ttk.Button(history_btns, text="Удалить выбранные", command=self.delete_selected_history)
+        btn_del_sel.grid(row=0, column=0, sticky="ew", padx=(0, 2))
+        btn_del_all = ttk.Button(history_btns, text="Удалить все", command=self.clear_history)
+        btn_del_all.grid(row=0, column=1, sticky="ew", padx=(2, 0))
+        self._bind_help(btn_del_sel, "Удалить выбранные в списке сохранённые траектории.")
+        self._bind_help(btn_del_all, "Удалить все сохранённые траектории.")
         row += 1
 
-        ttk.Label(left, text="Цвет сохраненной").grid(row=row, column=0, sticky="w", pady=2)
+        history_color_label = ttk.Label(left, text="Цвет сохраненной")
+        history_color_label.grid(row=row, column=0, sticky="w", pady=2)
         self.history_color_var = tk.StringVar(value="серый")
-        ttk.Combobox(left, textvariable=self.history_color_var, values=list(COLOR_MAP.keys()), state="readonly").grid(row=row, column=1, sticky="ew", pady=2)
+        history_color_combo = ttk.Combobox(left, textvariable=self.history_color_var, values=list(COLOR_MAP.keys()), state="readonly")
+        history_color_combo.grid(row=row, column=1, sticky="ew", pady=2)
+        color_help = "Цвет, которым будет нарисована следующая сохраняемая траектория (для отличия от текущей чёрно-красной)."
+        self._bind_help(history_color_label, color_help)
+        self._bind_help(history_color_combo, color_help)
         row += 1
 
-        ttk.Label(left, text="Тип линии").grid(row=row, column=0, sticky="w", pady=2)
+        history_style_label = ttk.Label(left, text="Тип линии")
+        history_style_label.grid(row=row, column=0, sticky="w", pady=2)
         self.history_style_var = tk.StringVar(value="штриховая")
-        ttk.Combobox(left, textvariable=self.history_style_var, values=list(STYLE_MAP.keys()), state="readonly").grid(row=row, column=1, sticky="ew", pady=2)
+        history_style_combo = ttk.Combobox(left, textvariable=self.history_style_var, values=list(STYLE_MAP.keys()), state="readonly")
+        history_style_combo.grid(row=row, column=1, sticky="ew", pady=2)
+        style_help = "Тип линии (сплошная, штриховая, штрихпунктирная, пунктирная) для следующей сохраняемой траектории."
+        self._bind_help(history_style_label, style_help)
+        self._bind_help(history_style_combo, style_help)
         row += 1
 
         ttk.Separator(left, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=6)
@@ -227,29 +389,43 @@ class MainWindow(tk.Frame):
         ttk.Label(left, text="Отображение на шаге").grid(row=row, column=0, columnspan=2, sticky="w")
         row += 1
         self.show_xg_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(left, text="Показывать Xg", variable=self.show_xg_var, command=self._redraw_if_ready).grid(row=row, column=0, columnspan=2, sticky="w")
+        cb_xg = ttk.Checkbutton(left, text="Показывать Xg", variable=self.show_xg_var, command=self._redraw_if_ready)
+        cb_xg.grid(row=row, column=0, columnspan=2, sticky="w")
+        self._bind_help(cb_xg, "Показывать на каждом шаге горизонтальную ось OXg — пунктирную опорную линию через текущую точку ОУ. Нужна для визуальной привязки углов ε и ϑ.")
         row += 1
         self.show_epsilon_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(left, text="Показывать угол ε", variable=self.show_epsilon_var, command=self._redraw_if_ready).grid(row=row, column=0, columnspan=2, sticky="w")
+        cb_eps = ttk.Checkbutton(left, text="Показывать угол ε", variable=self.show_epsilon_var, command=self._redraw_if_ready)
+        cb_eps.grid(row=row, column=0, columnspan=2, sticky="w")
+        self._bind_help(cb_eps, "Показывать дугу угла линии визирования ε (от оси OXg до направления на цель).")
         row += 1
         self.show_miss_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(left, text="Показывать промах h", variable=self.show_miss_var, command=self._redraw_if_ready).grid(row=row, column=0, columnspan=2, sticky="w")
+        cb_miss = ttk.Checkbutton(left, text="Показывать промах h", variable=self.show_miss_var, command=self._redraw_if_ready)
+        cb_miss.grid(row=row, column=0, columnspan=2, sticky="w")
+        self._bind_help(cb_miss, "Показывать мгновенный промах h на каждом шаге траектории. Формула:\n    h = d² · λ̇ / V_р,\nгде d — текущая дистанция, λ̇ — угловая скорость ЛВ, V_р — скорость ракеты.")
         row += 1
 
         btns = ttk.Frame(left)
         btns.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(10, 6))
         for i in range(4):
             btns.columnconfigure(i, weight=1)
-        ttk.Button(btns, text="Построить", command=self.build_trajectory).grid(row=0, column=0, sticky="ew", padx=2)
+        btn_build = ttk.Button(btns, text="Построить", command=self.build_trajectory)
+        btn_build.grid(row=0, column=0, sticky="ew", padx=2)
         self.btn_prev = ttk.Button(btns, text="Назад", command=self.prev_step, state="disabled")
         self.btn_prev.grid(row=0, column=1, sticky="ew", padx=2)
         self.btn_next = ttk.Button(btns, text="Вперед", command=self.next_step, state="disabled")
         self.btn_next.grid(row=0, column=2, sticky="ew", padx=2)
-        ttk.Button(btns, text="Очистить", command=self.clear_all).grid(row=0, column=3, sticky="ew", padx=2)
+        btn_clear = ttk.Button(btns, text="Очистить", command=self.clear_all)
+        btn_clear.grid(row=0, column=3, sticky="ew", padx=2)
+        self._bind_help(btn_build, "Запускает симуляцию по введённым параметрам и рисует траекторию (с подсветкой текущего шага).")
+        self._bind_help(self.btn_prev, "Перейти на один дискретный шаг назад. Параметры шага и графика обновляются.")
+        self._bind_help(self.btn_next, "Перейти на один дискретный шаг вперёд.")
+        self._bind_help(btn_clear, "Очистить текущий результат и график. Сохранённые траектории при этом остаются — их удаляют отдельными кнопками.")
         row += 1
 
         self.info = tk.StringVar(value="Выберите метод, задайте исходные данные и постройте дискретную траекторию.")
-        ttk.Label(left, textvariable=self.info, justify="left", wraplength=400).grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        info_label = ttk.Label(left, textvariable=self.info, justify="left", wraplength=400)
+        info_label.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self._bind_help(info_label, "Краткий итог последней симуляции: использованный метод, число дискретных точек, причина останова (контакт / расхождение / достигнут t_max).")
         row += 1
 
         ttk.Separator(left, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=8)
@@ -258,7 +434,19 @@ class MainWindow(tk.Frame):
         row += 1
 
         self.step_info = tk.StringVar(value="Нет данных")
-        ttk.Label(left, textvariable=self.step_info, justify="left", wraplength=400, relief="solid", padding=8).grid(row=row, column=0, columnspan=2, sticky="ew")
+        step_info_label = ttk.Label(left, textvariable=self.step_info, justify="left", wraplength=400, relief="solid", padding=8)
+        step_info_label.grid(row=row, column=0, columnspan=2, sticky="ew")
+        self._bind_help(step_info_label, (
+            "Параметры текущего дискретного шага:\n"
+            "  t — модельное время; d — дистанция ОУ-цель;\n"
+            "  ε — угол ЛВ от OXg; ϑ — курс ОУ; jц = ϑ − ε;\n"
+            "  qр / qц — углы вектора скорости ОУ/цели относительно ЛВ;\n"
+            "  ωε = λ̇ — угловая скорость ЛВ; λ̈ — её производная (только ПД);\n"
+            "  h — мгновенный промах: h = d²·λ̇ / V_р;\n"
+            "  V_сбл = −e_ЛВ · (V_ц − V_ОУ) — скорость сближения;\n"
+            "  a_n — реализованная нормальная перегрузка;\n"
+            "  Δ — невязка между требуемым и реализованным управлением."
+        ))
         row += 1
 
         ttk.Separator(left, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=8)
@@ -267,7 +455,15 @@ class MainWindow(tk.Frame):
         row += 1
 
         self.efficiency_info = tk.StringVar(value="Нет данных")
-        ttk.Label(left, textvariable=self.efficiency_info, justify="left", wraplength=400, relief="solid", padding=8).grid(row=row, column=0, columnspan=2, sticky="ew")
+        efficiency_label = ttk.Label(left, textvariable=self.efficiency_info, justify="left", wraplength=400, relief="solid", padding=8)
+        efficiency_label.grid(row=row, column=0, columnspan=2, sticky="ew")
+        self._bind_help(efficiency_label, (
+            "Сводка эффективности по всей траектории:\n"
+            "  Рейтинг: высокая (контакт) / низкая (расхождение) / не достигнута.\n"
+            "  R_min — минимальная дистанция между ОУ и целью за весь полёт и время её достижения.\n"
+            "  h_min, h_avg — минимальный и средний промах h по всем шагам.\n"
+            "  a_n max — максимум реализованной нормальной перегрузки."
+        ))
 
         self.fig = Figure(figsize=(10, 8), dpi=100)
         self.fig.subplots_adjust(left=0.045, right=0.988, bottom=0.075, top=0.945)
@@ -286,6 +482,96 @@ class MainWindow(tk.Frame):
 
     def _f(self, key):
         return float(self.vars[key].get().replace(",", ".").strip())
+
+    def _bind_help(self, widget, text):
+        widget.bind("<Button-3>", lambda event, t=text: self._show_help_popup(event, t))
+
+    def _make_collapsible(self, parent, title, expanded=True):
+        container = ttk.Frame(parent)
+        container.columnconfigure(0, weight=1)
+        body = ttk.Frame(container)
+        body.columnconfigure(1, weight=1)
+        arrow_var = tk.StringVar()
+        state = {"expanded": bool(expanded)}
+
+        def update_header():
+            arrow = "▼" if state["expanded"] else "▶"
+            arrow_var.set(f"{arrow}  {title}")
+
+        def toggle(_event=None):
+            state["expanded"] = not state["expanded"]
+            if state["expanded"]:
+                body.grid()
+            else:
+                body.grid_remove()
+            update_header()
+
+        header = ttk.Label(
+            container,
+            textvariable=arrow_var,
+            cursor="hand2",
+            font=("TkDefaultFont", 10, "bold"),
+        )
+        header.grid(row=0, column=0, sticky="ew", pady=(2, 2))
+        header.bind("<Button-1>", toggle)
+        body.grid(row=1, column=0, sticky="ew")
+        update_header()
+        if not state["expanded"]:
+            body.grid_remove()
+        return container, body, header
+
+    def _show_help_popup(self, event, text):
+        existing = getattr(self, "_help_popup", None)
+        if existing is not None:
+            try:
+                existing.destroy()
+            except tk.TclError:
+                pass
+            self._help_popup = None
+
+        top = tk.Toplevel(self.winfo_toplevel())
+        top.wm_overrideredirect(True)
+        top.attributes("-topmost", True)
+        border = tk.Frame(top, bg="#bda842")
+        border.pack()
+        lbl = tk.Label(
+            border,
+            text=text,
+            justify="left",
+            wraplength=460,
+            bg="#fff8c8",
+            fg="#222",
+            padx=10,
+            pady=8,
+            font=("TkDefaultFont", 9),
+            anchor="w",
+        )
+        lbl.pack(fill="both", padx=1, pady=1)
+        top.update_idletasks()
+        x = int(event.x_root) + 12
+        y = int(event.y_root) + 12
+        screen_w = top.winfo_screenwidth()
+        screen_h = top.winfo_screenheight()
+        win_w = top.winfo_reqwidth()
+        win_h = top.winfo_reqheight()
+        if x + win_w > screen_w:
+            x = max(0, screen_w - win_w - 4)
+        if y + win_h > screen_h:
+            y = max(0, screen_h - win_h - 4)
+        top.geometry(f"+{x}+{y}")
+
+        def dismiss(_event=None):
+            try:
+                top.destroy()
+            except tk.TclError:
+                pass
+
+        top.bind("<Button-1>", dismiss)
+        top.bind("<Button-3>", dismiss)
+        border.bind("<Button-1>", dismiss)
+        lbl.bind("<Button-1>", dismiss)
+        top.bind_all("<Escape>", dismiss, add="+")
+        self._help_popup = top
 
     def _sync_method_controls(self):
         method = self.method_var.get()
@@ -307,6 +593,10 @@ class MainWindow(tk.Frame):
         else:
             self.lead_angle_label.grid_remove()
             self.lead_angle_entry.grid_remove()
+        if hasattr(self, "method_description_var"):
+            self.method_description_var.set(
+                METHOD_DESCRIPTIONS.get(method, "Описание для метода не задано.")
+            )
 
     def _result_display_name(self):
         if self.result is None:
